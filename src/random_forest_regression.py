@@ -212,6 +212,7 @@ def plot_feature_distributions(df, features, target_name, target_type, output_di
     """
     os.makedirs(output_dir, exist_ok=True)
     df_plot = df.copy()
+    df_plot = df_plot.loc[:, ~df_plot.columns.duplicated()]
     if target_type == "continuous":
         # Bin the continuous target into 5 categories for grouping
         n_unique = df_plot[target_name].nunique()
@@ -235,6 +236,10 @@ def plot_feature_distributions(df, features, target_name, target_type, output_di
             plt.ylabel(feat)
         else:
             # Categorical feature: use countplot
+            print("🔍 feat:", feat)
+            print("🔍 hue_col:", hue_col)
+            print("🔍 df_plot[feat].shape:", df_plot[feat].shape)
+            print("🔍 df_plot[hue_col].shape:", df_plot[hue_col].shape)
             sns.countplot(x=feat, hue=hue_col, data=df_plot)
             title = f"Countplot of {feat} by {'Target' if target_type=='continuous' else target_name}"
             plt.title(title)
@@ -323,25 +328,78 @@ def main(args):
     print("Excel columns:", df_excel.columns.tolist())
     print("Parquet columns:", df_parquet.columns.tolist())
     
-    # Merge on common keys
     df_merged = merge_datasets(df_excel, df_parquet)
-    print(f"Merged data: {df_merged.shape} (rows, columns)")
+    print(f"Merged data before filtering: {df_merged.shape} (rows, columns)")
+    
+    # Keep only the target column from Excel
+    target_col = args.target  # e.g., "Ecological Class"
+    df_excel = df_excel.rename(columns={'Water Body ID': 'wb_id'})
+    target_df = df_excel[['wb_id', target_col]]
+    # Keep only WIMS columns from Parquet (used for prediction)
+    
+    # ---- NEW LINE: Filter to chemical-only columns ----
+    #chemical_keywords = ['NO3', 'NH4', 'PO4', 'Nitrate', 'Phosphate', 'Ammonia', 'Nitrogen', 'Phosphorus', 'mg/l', 'ug/l']
+    chemical_keywords = ['NO3', 'NH4', 'PO4', 'Nitrate', 'Phosphate', 'Ammonia', 
+                     'Nitrogen', 'Phosphorus', 'mg', 'ug', 'conc', 'chem']
+    chemical_cols = [col for col in df_parquet.columns 
+                 if any(kw.lower() in col.lower() for kw in chemical_keywords)]
+    wims_df = df_parquet[['wb_id'] + chemical_cols].copy()
+    
+
+    # Merge: target from Excel + features from WIMS
+    df_merged = pd.merge(target_df, wims_df, on='wb_id', how='inner')
+    
+    
+    
+    
+    #chemical_cols = [col for col in df_merged.columns if any(kw.lower() in col.lower() for kw in chemical_keywords)]
+
+    # Always include target and ID for merging
+    required_cols = ['wb_id', args.target]
+    chemical_subset = df_merged[required_cols + chemical_cols].dropna(subset=[args.target])
+    chemical_subset = chemical_subset.dropna()
+    print(f"Merged data after filtering chemical variables: {chemical_subset.shape} (rows, columns)")
+
+    print("Chemical columns found:", len(chemical_cols))
+    print("Sample chemical columns:", chemical_cols[:5])
+
+    df_merged = chemical_subset
 
     target = args.target
+    if isinstance(target, list):
+        target = target[0]
+        
     if target not in df_merged.columns:
         raise ValueError(f"Target '{target}' not in merged data.")
 
     # Drop rows with missing target
-    df_merged = df_merged.dropna(subset=[target]).reset_index(drop=True)
-    X = df_merged.drop(columns=[target])
+    df_model = df_merged.dropna(subset=[target]).reset_index(drop=True)
+    df_model = df_model.loc[:, ~df_model.columns.duplicated()]
+    X = df_model.drop(columns=[target]).copy()
+    y = df_model[target].copy()
+    
+    print("y type:", type(y))
+    print("y ndim:", y.ndim)
+    
+    print("X shape:", X.shape)
+    print("y shape:", y.shape)
+    print("Index match:", X.index.equals(y.index))
+    print("target value:", repr(target))
+    print("type:", type(target))
+    
+    
+    
+    # Encode only after this point
     for col in X.select_dtypes(include=['object', 'category']).columns:
         X[col] = X[col].astype(str)
         X[col] = LabelEncoder().fit_transform(X[col])
-    
-    y = df_merged[[target]]
+
+    # Final check
+    print("X shape:", X.shape)
+    print("y shape:", y.shape)
 
     # Determine target type
-    target_type = determine_target_type(y[target])
+    target_type = determine_target_type(y)
     print(f"Target '{target}' is detected as {target_type}.")
 
     # Split into train/test
