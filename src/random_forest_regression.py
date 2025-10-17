@@ -1,31 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Created on Sat Jul 19 20:18:36 2025
+Created on Sat Jul 26 18:28:04 2025
 
 @author: tompe
-"""
-
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Jul 17 20:01:00 2025
-
-@author: tompe
-"""
-
-"""
-Script to load and merge data from Excel and Parquet files, perform feature 
-selection, train Random Forest models (classifier and regressor), and output 
-predictions and plots.
-
-Usage:
-    python script.py --excel_path <path> --parquet_path <path> [--target TARGET]
-
-Requirements:
-    - pandas
-    - numpy
-    - scikit-learn
-    - matplotlib
-    - seaborn
 """
 
 import argparse
@@ -37,15 +14,43 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder, OrdinalEncoder
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.metrics import accuracy_score, f1_score
+from scipy.sparse import csr_matrix, hstack
 
 # Set random seeds for reproducibility
 RANDOM_STATE = 42
 random.seed(RANDOM_STATE)
 np.random.seed(RANDOM_STATE)
 
+# Configurable parameters for encoding and PDP
+MAX_CATEGORIES_FOR_ONEHOT = 20  # One-hot encode features with <=20 unique values (else use ordinal encoding)
+PDP_2D_PAIRS = [
+    ("Ammonia(N)", "Orthophospht"),
+    ("pH", "Temp Water"),
+    ("Nitrate-N", "N Oxidised"),
+    # ("Feature1", "Feature2"),  # Example pairs for 2D PDP plots
+    # Temperature & Chemistry
+    ("Temp Water", "Ammonia(N)"),
+    ("Temp Water", "Nitrate-N"),
+
+    # Nutrient Interactions
+    ("Orthophospht", "Nitrate-N"),
+    ("Ammonia(N)", "N Oxidised"),
+
+    # Oxygen + Nutrients
+    ("Dissolved Oxygen", "Ammonia(N)"),
+    ("Dissolved Oxygen", "Orthophospht"),
+
+    # Chemistry + pH
+    ("pH", "Ammonia(N)"),
+    ("pH", "N Oxidised"),
+
+    # Example for solids if available (you can remove if not in your dataset)
+    ("Suspended Solids", "Orthophospht"),
+    ("Conductivity", "Nitrate-N"),
+    ]
 
 def load_excel_data(excel_path):
     """
@@ -54,7 +59,6 @@ def load_excel_data(excel_path):
     """
     all_sheets = []
     try:
-        # Use pandas to get sheet names
         xls = pd.ExcelFile(excel_path, engine='openpyxl')
         sheets = xls.sheet_names
     except Exception as e:
@@ -66,13 +70,11 @@ def load_excel_data(excel_path):
         all_sheets.append(df_sheet)
     if not all_sheets:
         raise ValueError("No sheets found in Excel file.")
-    # Concatenate all sheets into one DataFrame
     df_excel = pd.concat(all_sheets, ignore_index=True)
     # Drop columns with 50% or more missing values
     thresh = len(df_excel) * 0.5
     df_excel = df_excel.loc[:, df_excel.isnull().sum() < thresh]
     return df_excel
-
 
 def load_parquet_data(parquet_path):
     """
@@ -91,15 +93,25 @@ def load_parquet_data(parquet_path):
     df_parquet = df_parquet.loc[:, cols_to_keep]
     return df_parquet
 
-
 def aggregate_parquet(df_parquet):
     """
     Aggregate WIMS data by wb_id, taking mean of numeric fields.
     """
     numeric_cols = df_parquet.select_dtypes(include=np.number).columns.tolist()
+    
     agg_df = df_parquet.groupby("wb_id")[numeric_cols].mean().reset_index()
+    
+    #agg_df = df_parquet.groupby("wb_id")[numeric_cols].median().reset_index()
+    
+    #agg_df = df_parquet.groupby("wb_id")[numeric_cols].apply(lambda x: x.mean(skipna=True) if len(x) > 10 else x.median()).reset_index()
+    
+    """
+    from scipy.stats import trim_mean
+    agg_df = df_parquet.groupby("wb_id")[numeric_cols].apply(
+    lambda x: x.dropna().apply(lambda col: trim_mean(col, 0.1))
+    ).reset_index()
+    """
     return agg_df
-
 
 def merge_datasets(df_excel, df_parquet):
     """
@@ -117,19 +129,14 @@ def merge_datasets(df_excel, df_parquet):
     df_merged = pd.merge(df_excel, df_parquet_agg, on="wb_id", how="inner")
     return df_merged
 
-
 def determine_target_type(series, cat_threshold=15):
     """
     Determine if the target series is categorical or continuous.
     """
     if pd.api.types.is_numeric_dtype(series):
-        if series.nunique() <= cat_threshold:
-            return "categorical"
-        else:
-            return "continuous"
+        return "categorical" if series.nunique() <= cat_threshold else "continuous"
     else:
         return "categorical"
-
 
 def train_models(X_train, y_train, target_type):
     """
@@ -151,10 +158,8 @@ def train_models(X_train, y_train, target_type):
         reg = RandomForestRegressor(random_state=RANDOM_STATE)
         reg.fit(X_train, y_encoded)
         encoder_or_bins = le
-
     else:
         # Continuous target
-        # Bin the target into up to 10 bins for classification
         n_bins = min(10, y_train.nunique())
         if n_bins >= 2:
             y_array = y_train.values.ravel()
@@ -165,9 +170,7 @@ def train_models(X_train, y_train, target_type):
         # Train regressor on actual continuous target
         reg = RandomForestRegressor(random_state=RANDOM_STATE)
         reg.fit(X_train, y_train.values.ravel())
-
     return clf, reg, encoder_or_bins
-
 
 def get_top_features(importances, feature_names, top_n=15):
     """
@@ -176,7 +179,6 @@ def get_top_features(importances, feature_names, top_n=15):
     feat_imp = sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)
     top_features = [f for f, imp in feat_imp[:top_n]]
     return top_features, feat_imp[:top_n]
-
 
 def plot_feature_importance(importances, feature_names, output_path, target_name=None):
     """
@@ -194,7 +196,6 @@ def plot_feature_importance(importances, feature_names, output_path, target_name
     plt.xlabel("Importance")
     plt.ylabel("Feature")
     # Annotate bars with importance values
-    ax = plt.gca()
     for p in ax.patches:
         width = p.get_width()
         ax.text(width + 0.001, p.get_y() + p.get_height()/2, f"{width:.2f}", va='center')
@@ -203,11 +204,10 @@ def plot_feature_importance(importances, feature_names, output_path, target_name
     plt.savefig(output_path)
     plt.close()
 
-
 def plot_feature_distributions(df, features, target_name, target_type, output_dir):
     """
     Plot and save distribution plots for features.
-    Categorical features: countplot; Continuous: boxplot.
+    Categorical features: countplot; Continuous features: boxplot.
     Grouped by target variable (or its binned version if continuous).
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -236,10 +236,6 @@ def plot_feature_distributions(df, features, target_name, target_type, output_di
             plt.ylabel(feat)
         else:
             # Categorical feature: use countplot
-            print("🔍 feat:", feat)
-            print("🔍 hue_col:", hue_col)
-            print("🔍 df_plot[feat].shape:", df_plot[feat].shape)
-            print("🔍 df_plot[hue_col].shape:", df_plot[hue_col].shape)
             sns.countplot(x=feat, hue=hue_col, data=df_plot)
             title = f"Countplot of {feat} by {'Target' if target_type=='continuous' else target_name}"
             plt.title(title)
@@ -252,7 +248,6 @@ def plot_feature_distributions(df, features, target_name, target_type, output_di
         out_file = os.path.join(output_dir, f"{safe_feat}_{plot_type}.png")
         plt.savefig(out_file)
 
-
 def save_predictions_csv(filename, X, y_true, clf_pred, reg_pred, combined_pred):
     """
     Save features, true target, and predictions to CSV.
@@ -264,15 +259,12 @@ def save_predictions_csv(filename, X, y_true, clf_pred, reg_pred, combined_pred)
     df_out['Pred_Combined'] = combined_pred
     df_out.to_csv(filename, index=False)
 
-
 def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plots/feature_score_scatter.png"):
     """
     Evaluates each feature and all features together using StratifiedKFold and 
     plots accuracy vs F1. Saves the plot to the specified path.
     """
-    import os
     os.makedirs("plots", exist_ok=True)
-
     results = []
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
@@ -300,7 +292,7 @@ def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plot
         f1_scores.append(f1_score(y_test, y_pred, average='macro'))
     results.append({"Feature": "All Features", "Accuracy": np.mean(acc_scores), "F1 Score": np.mean(f1_scores)})
 
-    # Plot
+    # Plot scatter of Accuracy vs F1
     df_results = pd.DataFrame(results)
     plt.figure(figsize=(10, 6))
     plt.scatter(df_results["Accuracy"], df_results["F1 Score"], c='skyblue', edgecolors='black')
@@ -315,7 +307,6 @@ def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plot
     plt.show()
     print(f"Scatter plot saved as '{output_path}'")
 
-
 def main(args):
     # Load data
     df_excel = load_excel_data(args.excel_path)
@@ -324,115 +315,193 @@ def main(args):
     print(f"Excel data: {df_excel.shape} (rows, columns)")
     df_parquet = load_parquet_data(args.parquet_path)
     print(f"Parquet data: {df_parquet.shape} (rows, columns)")
-    
-    print("Excel columns:", df_excel.columns.tolist())
-    print("Parquet columns:", df_parquet.columns.tolist())
-    
+
+    # (Optional debugging prints of columns)
+    # print("Excel columns:", df_excel.columns.tolist())
+    # print("Parquet columns:", df_parquet.columns.tolist())
+
     df_merged = merge_datasets(df_excel, df_parquet)
     print(f"Merged data before filtering: {df_merged.shape} (rows, columns)")
-    
-    # Keep only the target column from Excel
-    target_col = args.target  # e.g., "Ecological Class"
+
+    # Keep only the target column from Excel and chemical features from Parquet
+    target_col = args.target
     df_excel = df_excel.rename(columns={'Water Body ID': 'wb_id'})
     target_df = df_excel[['wb_id', target_col]]
-    # Keep only WIMS columns from Parquet (used for prediction)
-    
-    # ---- NEW LINE: Filter to chemical-only columns ----
-    #chemical_keywords = ['NO3', 'NH4', 'PO4', 'Nitrate', 'Phosphate', 'Ammonia', 'Nitrogen', 'Phosphorus', 'mg/l', 'ug/l']
-    chemical_keywords = ['NO3', 'NH4', 'PO4', 'Nitrate', 'Phosphate', 'Ammonia', 
-                     'Nitrogen', 'Phosphorus', 'mg', 'ug', 'conc', 'chem']
-    chemical_cols = [col for col in df_parquet.columns 
-                 if any(kw.lower() in col.lower() for kw in chemical_keywords)]
+    # Example filter: keep only chemical-related columns from Parquet
+    """
+    chemical_keywords = ['NO3', 'NH4', 'PO4', 'Nitrate', 'Phosphate', 'Ammonia', 'Nitrogen', 'Phosphorus', 'mg', 'ug', 'conc', 'chem']
+    chemical_cols = [col for col in df_parquet.columns if any(kw.lower() in col.lower() for kw in chemical_keywords)]
     wims_df = df_parquet[['wb_id'] + chemical_cols].copy()
-    
-
-    # Merge: target from Excel + features from WIMS
+    # Merge target and features
     df_merged = pd.merge(target_df, wims_df, on='wb_id', how='inner')
-    
-    
-    
-    
-    #chemical_cols = [col for col in df_merged.columns if any(kw.lower() in col.lower() for kw in chemical_keywords)]
+    """
+    var_counts = df_parquet['variable'].value_counts()
+    frequent_vars = var_counts[var_counts > 1e6].index.tolist()
 
-    # Always include target and ID for merging
-    required_cols = ['wb_id', args.target]
-    chemical_subset = df_merged[required_cols + chemical_cols].dropna(subset=[args.target])
+    print(f"Found {len(frequent_vars)} frequent variables with > 1M records")
+    print("Sample:", frequent_vars[:5])
+    
+    # STEP 2: Filter Parquet to only those variables
+    df_filtered = df_parquet[df_parquet['variable'].isin(frequent_vars)]
+
+    # STEP 3: Pivot data to wide format (each variable becomes a column)
+    pivot_df = df_filtered.pivot_table(
+        index='wb_id',
+        columns='variable',
+        values='result',
+        aggfunc='mean'
+        ).reset_index()
+
+    # STEP 4: Merge with Excel target
+    df_excel = df_excel.rename(columns={'Water Body ID': 'wb_id'})
+    target_df = df_excel[['wb_id', target_col]]
+    df_merged = pd.merge(target_df, pivot_df, on='wb_id', how='inner')
+
+    # STEP 5: Drop NaNs
+    df_merged = df_merged.dropna()
+    
+    """
+    # Filter out rows with any missing values
+    chemical_subset = df_merged[['wb_id', args.target] + chemical_cols].dropna(subset=[args.target])
     chemical_subset = chemical_subset.dropna()
     print(f"Merged data after filtering chemical variables: {chemical_subset.shape} (rows, columns)")
-
     print("Chemical columns found:", len(chemical_cols))
     print("Sample chemical columns:", chemical_cols[:5])
-
     df_merged = chemical_subset
-
+    """
     target = args.target
     if isinstance(target, list):
         target = target[0]
-        
     if target not in df_merged.columns:
         raise ValueError(f"Target '{target}' not in merged data.")
 
-    # Drop rows with missing target
+    # Drop rows with missing target (already handled above, but ensure none remain)
     df_model = df_merged.dropna(subset=[target]).reset_index(drop=True)
     df_model = df_model.loc[:, ~df_model.columns.duplicated()]
+    # Drop unique ID column to reduce dimensionality and avoid overfitting
+    if 'wb_id' in df_model.columns:
+        df_model = df_model.drop(columns=['wb_id'])
     X = df_model.drop(columns=[target]).copy()
     y = df_model[target].copy()
-    
-    print("y type:", type(y))
-    print("y ndim:", y.ndim)
-    
+
+    # Debugging shape and type information
     print("X shape:", X.shape)
     print("y shape:", y.shape)
     print("Index match:", X.index.equals(y.index))
-    print("target value:", repr(target))
-    print("type:", type(target))
-    
-    
-    
-    # Encode only after this point
-    for col in X.select_dtypes(include=['object', 'category']).columns:
-        X[col] = X[col].astype(str)
-        X[col] = LabelEncoder().fit_transform(X[col])
+    print(f"Target '{target}' type:", type(y.iloc[0]))
 
-    # Final check
-    print("X shape:", X.shape)
-    print("y shape:", y.shape)
-
-    # Determine target type
+    # Determine target type (categorical vs continuous)
     target_type = determine_target_type(y)
     print(f"Target '{target}' is detected as {target_type}.")
 
     # Split into train/test
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=RANDOM_STATE)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE)
     print(f"Train size: {X_train.shape[0]}, Test size: {X_test.shape[0]}")
+
+    # Memory Efficiency: Encode categorical features without creating a huge dense matrix
+    cat_cols = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
+    small_cat_cols = []
+    high_cat_cols = []
+    if cat_cols:
+        # Convert categorical columns to string type for uniform encoding
+        for col in cat_cols:
+            X_train[col] = X_train[col].astype(str)
+            X_test[col] = X_test[col].astype(str)
+        # Decide which categorical features to one-hot encode (low cardinality) and which to ordinal encode (high cardinality)
+        small_cat_cols = [col for col in cat_cols if X_train[col].nunique() <= MAX_CATEGORIES_FOR_ONEHOT]
+        high_cat_cols = [col for col in cat_cols if X_train[col].nunique() > MAX_CATEGORIES_FOR_ONEHOT]
+        # One-hot encode low-cardinality categoricals (sparse output)
+        if small_cat_cols:
+            ohe = OneHotEncoder(sparse=True, handle_unknown='ignore')
+            X_train_onehot = ohe.fit_transform(X_train[small_cat_cols])
+            X_test_onehot = ohe.transform(X_test[small_cat_cols])
+            onehot_feature_names = ohe.get_feature_names_out(small_cat_cols)
+        else:
+            X_train_onehot = None
+            X_test_onehot = None
+            onehot_feature_names = []
+        # Ordinal encode high-cardinality categoricals
+        if high_cat_cols:
+            ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+            X_train_ord = ord_enc.fit_transform(X_train[high_cat_cols])
+            X_test_ord = ord_enc.transform(X_test[high_cat_cols])
+        else:
+            ord_enc = None
+            X_train_ord = None
+            X_test_ord = None
+        # Combine numeric, ordinal, and one-hot parts into sparse matrices
+        parts_train = []
+        parts_test = []
+        numeric_cols = [col for col in X_train.columns if col not in cat_cols]
+        if numeric_cols:
+            parts_train.append(csr_matrix(X_train[numeric_cols].values))
+            parts_test.append(csr_matrix(X_test[numeric_cols].values))
+        if high_cat_cols:
+            parts_train.append(csr_matrix(X_train_ord))
+            parts_test.append(csr_matrix(X_test_ord))
+        if small_cat_cols:
+            parts_train.append(X_train_onehot)
+            parts_test.append(X_test_onehot)
+        X_train_enc = hstack(parts_train).tocsr()
+        X_test_enc = hstack(parts_test).tocsr()
+        # Feature name list after encoding
+        feature_names_enc = numeric_cols + high_cat_cols + list(onehot_feature_names)
+    else:
+        # No categorical features; proceed without encoding
+        X_train_enc = X_train.values
+        X_test_enc = X_test.values
+        feature_names_enc = list(X_train.columns)
+        ord_enc = None  # no ordinal encoding used
+
+    # Use encoded feature matrices for model training
+    X_train = X_train_enc
+    X_test = X_test_enc
 
     # Train initial models on all features
     clf, reg, encoder_or_bins = train_models(X_train, y_train, target_type)
 
-    # Feature importances from classifier or regressor
+    # Get feature importances from the appropriate model
     if target_type == "categorical" and clf is not None:
         importances = clf.feature_importances_
-        feature_names = X_train.columns
+        feature_names = feature_names_enc
     elif reg is not None:
         importances = reg.feature_importances_
-        feature_names = X_train.columns
+        feature_names = feature_names_enc
     else:
         raise ValueError("No valid model to determine feature importances.")
 
-    # Select top 15 features
+    # Select top 15 features by importance
     top_feats, top_importances = get_top_features(importances, feature_names, top_n=15)
     print("Top 15 features:")
+    # Encode y_test for evaluation if classification
     if target_type == "categorical":
-        le = LabelEncoder()
-        y_test_enc = le.fit_transform(y_test.values.ravel())
+        le_temp = LabelEncoder()
+        y_test_enc = le_temp.fit_transform(y_test.values.ravel())
     else:
         y_test_enc = y_test.values.ravel()
-    
     for feat, imp in top_importances:
         print(f"  {feat}: {imp:.4f}")
 
-    # Correlation matrix of top 15 features
+    # Prepare original full dataset X for analysis (correlation, PDP, etc.)
+    # If ordinal encoding was used for high-cardinality features, apply it to full X for consistency
+    if high_cat_cols:
+        for col in high_cat_cols:
+            X[col] = X[col].astype(str)
+        try:
+            X[high_cat_cols] = ord_enc.transform(X[high_cat_cols])
+        except Exception as e:
+            print(f"Warning: could not ordinal-encode all high-cardinality features: {e}")
+    # Add dummy columns for any one-hot encoded features in top_feats (to include in correlation and plots)
+    for feat in top_feats:
+        if feat not in X.columns:
+            for col in cat_cols:
+                if feat.startswith(str(col) + "_"):
+                    cat_val = feat[len(col)+1:]
+                    # Create dummy indicator column for this category
+                    X[feat] = (X[col].astype(str) == cat_val).astype(int)
+                    break
+
+    # Correlation matrix of top 15 features (numeric features and any newly added dummy features)
     os.makedirs("plots", exist_ok=True)
     corr_df = X[top_feats].dropna()
     corr_matrix = corr_df.corr()
@@ -443,7 +512,7 @@ def main(args):
     plt.savefig("plots/correlation_matrix.png")
     plt.show()
 
-    # Cross-validation accuracy boxplot (5-fold StratifiedKFold)
+    # Cross-validation accuracy boxplot (5-fold StratifiedKFold) on top features
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     clf_cv = RandomForestClassifier(random_state=RANDOM_STATE)
     scores = cross_val_score(clf_cv, X[top_feats], y.values.ravel(), cv=skf, scoring='accuracy')
@@ -455,36 +524,48 @@ def main(args):
     plt.savefig("plots/cv_accuracy_boxplot.png")
     plt.show()
 
-    # Plot feature importances (highlighting top features for target prediction)
+    # Plot feature importances and save
     plot_feature_importance(importances, feature_names, "plots/feature_importance.png", target)
     print("Feature importance plot saved as 'plots/feature_importance.png'.")
 
-    # Subset data to top features
-    X_train_sel = X_train[top_feats]
-    X_test_sel = X_test[top_feats]
+    # Subset training and test data to top features only
+    feat_index_map = {name: idx for idx, name in enumerate(feature_names_enc)}
+    top_indices = [feat_index_map[f] for f in top_feats if f in feat_index_map]
+    if isinstance(X_train, np.ndarray) or hasattr(X_train, 'toarray'):
+        # If X_train is an array or sparse matrix, slice and convert to DataFrame
+        X_train_sel_enc = X_train[:, top_indices]
+        X_test_sel_enc = X_test[:, top_indices]
+        X_train_sel = pd.DataFrame(X_train_sel_enc.toarray() if hasattr(X_train_sel_enc, 'toarray') else X_train_sel_enc,
+                                   columns=top_feats)
+        X_test_sel = pd.DataFrame(X_test_sel_enc.toarray() if hasattr(X_test_sel_enc, 'toarray') else X_test_sel_enc,
+                                  columns=top_feats)
+    else:
+        # If X_train is still a DataFrame (no encoding needed), select columns directly
+        X_train_sel = X_train[top_feats].copy()
+        X_test_sel = X_test[top_feats].copy()
 
-    # Retrain models on selected features
+    # Retrain models on selected top features
     clf2, reg2, encoder_or_bins2 = train_models(X_train_sel, y_train, target_type)
 
-    # Predictions
+    # Make predictions on test set using both models
     if target_type == "categorical":
-        # Predict class (encoded)
+        # Classifier predicted classes (encoded) and regressor predictions (encoded)
         clf_pred_enc = clf2.predict(X_test_sel)
         reg_pred = reg2.predict(X_test_sel)
-        # Combine predictions: average and round
+        # Combine classifier and regressor predictions (average) and round to nearest class
         avg_pred = 0.5 * (clf_pred_enc + reg_pred)
         combined_num = np.rint(avg_pred).astype(int)
-        # Clip to valid range
-        le = encoder_or_bins  # LabelEncoder from train
+        # Clip combined predictions to valid label range and invert encoding to original labels
+        le = encoder_or_bins  # LabelEncoder from initial training
         combined_num = np.clip(combined_num, 0, len(le.classes_) - 1)
         final_pred = le.inverse_transform(combined_num)
         clf_pred = le.inverse_transform(clf_pred_enc)
-        # Keep reg_pred numeric as float (predicted encoded class values)
+        # reg_pred remains numeric (encoded class values)
     else:
         # Continuous target
         reg_pred = reg2.predict(X_test_sel)
         if clf2 is not None:
-            # Map classifier's binned predictions to numeric via median of bins
+            # If classifier was trained (target binned), map its predictions back to numeric scale
             clf_pred_bins = clf2.predict(X_test_sel)
             df_temp = pd.DataFrame({'target': y_train.values.ravel()})
             n_bins = len(np.unique(clf_pred_bins))
@@ -493,33 +574,37 @@ def main(args):
             class_pred_numeric = np.array([bin_medians.get(b, np.nan) for b in clf_pred_bins])
             final_pred = 0.5 * (class_pred_numeric + reg_pred)
             clf_pred = clf_pred_bins
-            
+            # Store combined prediction in a global variable if needed
             global ECO_CLASS
             ECO_CLASS = final_pred
         else:
             final_pred = reg_pred
             clf_pred = [None] * len(reg_pred)
 
-    # Save predictions and true labels
+    # Save predictions and true labels to CSV
     save_predictions_csv("model_predictions.csv", X_test_sel, y_test, clf_pred, reg_pred, final_pred)
     print("Predictions saved to 'model_predictions.csv'.")
 
-    # Plot feature distributions on the merged dataset for top features
-    df_plot = df_merged[top_feats + [target]].dropna()
+    # Plot feature distributions for top features on entire dataset
+    df_plot = X[top_feats].copy()
+    df_plot[target] = y.values
+    df_plot = df_plot.dropna()
     if target_type == "categorical":
         df_plot[target] = df_plot[target].astype(str)
+        # Treat dummy features as categorical for plotting
+        for feat in top_feats:
+            if feat not in df_model.columns:
+                df_plot[feat] = df_plot[feat].astype('category')
     plot_feature_distributions(df_plot, top_feats, target, target_type, output_dir="feature_plots")
     print("Feature distribution plots saved to 'feature_plots/' directory.")
 
+    # Evaluate performance of top features (accuracy vs F1 scatter)
     evaluate_and_plot_feature_performance(X_test_sel, pd.Series(y_test_enc), top_feats)
-    #return final_pred
     model_used = clf2 if target_type == "categorical" else reg2
     return final_pred, model_used, X_train_sel, top_feats
 
-
 from sklearn.inspection import partial_dependence, PartialDependenceDisplay
 from sklearn.base import is_classifier
-
 
 def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
     """
@@ -539,7 +624,7 @@ def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
     else:
         top_idx = np.arange(min(top_n, X.shape[1]))
     top_features = [feature_names[i] for i in top_idx]
-    
+
     is_class = is_classifier(model)
     numeric_classes = False
     if is_class:
@@ -548,27 +633,20 @@ def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
             numeric_classes = np.issubdtype(classes.dtype, np.number)
         except Exception:
             numeric_classes = False
-    
+
     explanations = []
     # Loop through each top feature
     for idx, fname in zip(top_idx, top_features):
-        # Compute partial dependence (average)
+        # Compute partial dependence with individual predictions for std calculation
         try:
-            pdp_res = partial_dependence(model, X, [idx], feature_names=feature_names, kind='average')
+            pdp_res = partial_dependence(model, X, [idx], feature_names=feature_names, kind='both')
         except TypeError:
             pdp_res = partial_dependence(model, X, [idx], feature_names=feature_names)
         # Extract grid values and average predictions
-        if "values" in pdp_res:
-            grid = pdp_res["values"][0]
-        else:
-            grid = pdp_res["grid_values"][0]
+        grid = pdp_res["values"][0] if "values" in pdp_res else pdp_res["grid_values"][0]
         avg_data = pdp_res["average"]
-        if avg_data.ndim > 1:
-            avg_preds = np.ravel(avg_data[0])
-        else:
-            avg_preds = np.ravel(avg_data)
-        
-        # Interpret trend
+        avg_preds = np.ravel(avg_data[0]) if avg_data.ndim > 1 else np.ravel(avg_data)
+        # Interpret monotonic trend
         diff = np.diff(avg_preds)
         if np.all(diff >= 0):
             trend = f"as {fname} increases, predicted {target_name} tends to increase"
@@ -580,68 +658,104 @@ def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
             else:
                 trend = f"{fname} has a non-monotonic effect on {target_name}"
         explanations.append(f"Feature '{fname}': {trend}.")
-        
-        # Plot the partial dependence
-        try:
-            display = PartialDependenceDisplay.from_estimator(model, X, [idx], feature_names=feature_names)
-            # Label the plot
-            # The axes_ array is 2D even for one feature; access first element
-            ax = display.axes_[0][0] if hasattr(display.axes_, 'shape') else display.axes_[0]
-            ax.set_title(f"PDP of {fname}")
-            plt.tight_layout()
-            plt.show()
-        except Exception:
-            # Fallback manual plot if needed
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.plot(grid, avg_preds, marker='o')
-            ax.set_xlabel(fname)
-            ax.set_ylabel(target_name)
-            ax.set_title(f"PDP of {fname}")
-            plt.tight_layout()
-            plt.show()
-    
-    # Print textual explanations
+
+        # Plot the partial dependence with standard deviation bands
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(grid, avg_preds, label="Average prediction")
+        indiv_curves = pdp_res.get("individual", None)
+        if indiv_curves is not None:
+            if indiv_curves.ndim > 2:
+                indiv_curves = indiv_curves[0]  # first output if multi-output
+            std = np.std(indiv_curves, axis=0)
+            ax.fill_between(grid, avg_preds - std, avg_preds + std, alpha=0.3, label="\u00B1 1 std")
+        ax.set_xlabel(fname)
+        ax.set_ylabel(target_name)
+        ax.set_title(f"PDP of {fname}")
+        if indiv_curves is not None:
+            ax.legend()
+        plt.tight_layout()
+        plt.show()
+
+    # Print textual explanations for each top feature
     print("\n".join(explanations))
 
+    # 2D Partial Dependence Plots for specified feature pairs
+    if PDP_2D_PAIRS:
+        for f1, f2 in PDP_2D_PAIRS:
+            if f1 in feature_names and f2 in feature_names:
+                idx1 = feature_names.index(f1)
+                idx2 = feature_names.index(f2)
+                print(f"\nGenerating 2D PDP for features: {f1} and {f2}")
 
+            # Use a smaller subset of X for faster computation
+            X_pdp = X.copy()
+            if len(X_pdp) > 2000:  # Limit sample size
+                X_pdp = X_pdp.sample(n=2000, random_state=RANDOM_STATE)
 
+            try:
+                # You want to target a specific ecological class for PDP
+                TARGET_CLASS_NAME = "Moderate"
 
+                # Get the class index from the trained classifier
+                class_index = model.classes_.tolist().index(TARGET_CLASS_NAME)
+
+                # Use that in PDP
+                display = PartialDependenceDisplay.from_estimator(
+                    model,
+                    X_pdp,
+                    [(idx1, idx2)],
+                    feature_names=feature_names,
+                    grid_resolution=25,
+                    target=class_index,
+                )
+                plt.tight_layout()
+                out_file = f"plots/pdp_2d_{f1}_{f2}.png"
+                plt.savefig(out_file, bbox_inches="tight")
+                plt.close()
+                print(f"2D PDP saved as {out_file}")
+            except Exception as e:
+                # Fallback if from_estimator fails
+                print(f" Skipped 2D PDP for {f1} & {f2}: {e}")
+                try:
+                    pdp_res_2d = partial_dependence(
+                        model, X_pdp, [(idx1, idx2)],
+                        feature_names=feature_names,
+                        grid_resolution=25
+                    )
+                    grid1 = pdp_res_2d['grid_values'][0]
+                    grid2 = pdp_res_2d['grid_values'][1]
+                    avg_preds_2d = pdp_res_2d['average'][0]
+                    Xx, Yy = np.meshgrid(grid2, grid1)
+                    plt.figure(figsize=(6, 5))
+                    plt.contourf(Xx, Yy, avg_preds_2d, cmap='viridis')
+                    plt.colorbar(label='Predicted')
+                    plt.xlabel(f2)
+                    plt.ylabel(f1)
+                    plt.title(f"2D PDP of {f1} and {f2}")
+                    out_file = f"plots/pdp_2d_{f1}_{f2}_fallback.png"
+                    plt.savefig(out_file, bbox_inches="tight")
+                    plt.close()
+                    print(f"2D PDP saved (fallback) as {out_file}")
+                except Exception as ee:
+                    print(f"Failed 2D PDP fallback for {f1} & {f2}: {ee}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Data processing and modeling")
-    parser.add_argument("--excel_path", type=str,
-                        default="WFD_SW_Classification_Status_and_Objectives_Cycle2_v4.xlsx")
-    parser.add_argument("--parquet_path", type=str,
-                        default="wims_wfd_merged.parquet")
+    parser.add_argument("--excel_path", type=str, default="WFD_SW_Classification_Status_and_Objectives_Cycle2_v4.xlsx")
+    parser.add_argument("--parquet_path", type=str, default="wims_wfd_merged.parquet")
     parser.add_argument("--target", type=str, default="Ecological Class")
     args = parser.parse_args()
-    
-    ECO_CLASS, model, X_train_used, feature_names_used = main(args)
+    final_pred, model, X_train_used, feature_names_used = main(args)
     explain_model(model, X_train_used, feature_names=feature_names_used, target_name=args.target, top_n=15)
     
-#multi varaible pdp plots
-#only using chemicl data
-# presentations    
-
-
-
-
-
-
-"""
-import pandas as pd
-# Load the data
-wims_wfd_merged = pd.read_parquet(r"\path\to\wims_wfd_merged.parquet")
-
-# Use only the (e.g.,) variables with > million samples
-counts = wims_wfd_merged.variable.value_counts()
-counts = counts[counts>1e6]
-wims_wfd_merged = wims_wfd_merged.loc[wims_wfd_merged.variable.isin(counts.index)]
-
-# Aggregate data to catchment-year-variable scale (try varying from mean, median, quantile)
-grouped = wims_wfd_merged.groupby(["wb_id","year","variable"]).result.mean().reset_index()
-
-# Format for sklearn
-pivoted = grouped.pivot(index=["wb_id","year"],columns=["variable"],values="result")
-print(pivoted.reset_index())
-"""
+    
+    
+# accuracy and f1 for just predicting "moderate"
+# try quantiles
+# softwhere testing
+# alterative AI prosseing
+# more interactive data visulisation "streamlit"
+# orange "load in data and describe it"
+# data visuliation, robustness, more usfull
+# interal anual varaiblity
+# intigrate it into an "app" - streamlit
