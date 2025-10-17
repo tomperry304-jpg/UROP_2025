@@ -435,6 +435,9 @@ def main(args):
             class_pred_numeric = np.array([bin_medians.get(b, np.nan) for b in clf_pred_bins])
             final_pred = 0.5 * (class_pred_numeric + reg_pred)
             clf_pred = clf_pred_bins
+            
+            global ECO_CLASS
+            ECO_CLASS = final_pred
         else:
             final_pred = reg_pred
             clf_pred = [None] * len(reg_pred)
