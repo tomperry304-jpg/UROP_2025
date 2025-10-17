@@ -18,6 +18,9 @@ from sklearn.preprocessing import LabelEncoder, OneHotEncoder, OrdinalEncoder
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.metrics import accuracy_score, f1_score
 from scipy.sparse import csr_matrix, hstack
+from sklearn.model_selection import GridSearchCV
+from lightgbm import LGBMClassifier
+
 
 # Set random seeds for reproducibility
 RANDOM_STATE = 42
@@ -93,24 +96,46 @@ def load_parquet_data(parquet_path):
     df_parquet = df_parquet.loc[:, cols_to_keep]
     return df_parquet
 
+
 def aggregate_parquet(df_parquet):
     """
-    Aggregate WIMS data by wb_id, taking mean of numeric fields.
+    Aggregate WIMS data by wb_id with richer features for better predictive power.
     """
     numeric_cols = df_parquet.select_dtypes(include=np.number).columns.tolist()
-    
-    agg_df = df_parquet.groupby("wb_id")[numeric_cols].mean().reset_index()
-    
-    #agg_df = df_parquet.groupby("wb_id")[numeric_cols].median().reset_index()
-    
-    #agg_df = df_parquet.groupby("wb_id")[numeric_cols].apply(lambda x: x.mean(skipna=True) if len(x) > 10 else x.median()).reset_index()
-    
-    """
-    from scipy.stats import trim_mean
-    agg_df = df_parquet.groupby("wb_id")[numeric_cols].apply(
-    lambda x: x.dropna().apply(lambda col: trim_mean(col, 0.1))
-    ).reset_index()
-    """
+
+    # Compute core stats
+    agg_df = df_parquet.groupby("wb_id")[numeric_cols].agg(
+        ['mean', 'median', 'std', 'min', 'max']
+    )
+
+    # Flatten multi-level columns
+    agg_df.columns = ['_'.join(col).strip() for col in agg_df.columns.values]
+
+    # ---- Extra Features: episodic high pollution & trend ----
+    # Example threshold: mean + 2*std of the variable
+    df_parquet['dynamic_threshold'] = df_parquet.groupby('variable')['result'].transform(
+        lambda x: x.mean() + 2*x.std()
+    )
+    df_parquet['above_threshold'] = (df_parquet['result'] > df_parquet['dynamic_threshold']).astype(int)
+
+    # Count and proportion above threshold
+    agg_extra = df_parquet.groupby('wb_id')['above_threshold'].agg(['sum', 'mean']).reset_index()
+    agg_extra.rename(columns={'sum': 'count_above_thr', 'mean': 'prop_above_thr'}, inplace=True)
+
+    # Trend (slope) per water body
+    if 'date' in df_parquet.columns:
+        df_parquet['ordinal_time'] = pd.to_datetime(df_parquet['date']).map(pd.Timestamp.toordinal)
+        slope_df = df_parquet.groupby('wb_id').apply(
+            lambda g: np.polyfit(g['ordinal_time'], g['result'], 1)[0] if len(g)>1 else 0
+        ).reset_index(name='trend_slope')
+    else:
+        slope_df = pd.DataFrame({'wb_id': df_parquet['wb_id'].unique(), 'trend_slope': 0})
+
+    # Merge extra features
+    agg_df = agg_df.reset_index()
+    agg_df = agg_df.merge(agg_extra, on='wb_id', how='left')
+    agg_df = agg_df.merge(slope_df, on='wb_id', how='left')
+
     return agg_df
 
 def merge_datasets(df_excel, df_parquet):
@@ -140,36 +165,60 @@ def determine_target_type(series, cat_threshold=15):
 
 def train_models(X_train, y_train, target_type):
     """
-    Train RandomForestClassifier and RandomForestRegressor on the data.
-    Returns trained classifier, regressor, and encoder/bins info.
+    Train RandomForest with hyperparameter tuning for better performance.
     """
     clf = None
     reg = None
     encoder_or_bins = None
 
     if target_type == "categorical":
-        # Label-encode y for training
+        # Label-encode y
         le = LabelEncoder()
         y_encoded = le.fit_transform(y_train.values.ravel())
-        # Train classifier
-        clf = RandomForestClassifier(random_state=RANDOM_STATE)
-        clf.fit(X_train, y_encoded)
-        # Train regressor on the encoded labels
-        reg = RandomForestRegressor(random_state=RANDOM_STATE)
+
+        # --- RandomForest Hyperparameter Tuning ---
+        param_grid = {
+            'n_estimators': [300, 500],
+            'max_depth': [None, 20, 50],
+            'min_samples_leaf': [1, 2, 5],
+            'class_weight': ['balanced']
+        }
+
+        grid = GridSearchCV(
+            RandomForestClassifier(random_state=RANDOM_STATE),
+            param_grid,
+            cv=3,
+            scoring='f1_macro',
+            n_jobs=-1
+        )
+        grid.fit(X_train, y_encoded)
+
+        clf = grid.best_estimator_
+        print("Best RandomForest params:", grid.best_params_)
+
+        # Train regressor for combined prediction
+        reg = RandomForestRegressor(
+            n_estimators=500,
+            max_depth=grid.best_params_['max_depth'],
+            min_samples_leaf=grid.best_params_['min_samples_leaf'],
+            random_state=RANDOM_STATE
+        )
         reg.fit(X_train, y_encoded)
+
         encoder_or_bins = le
+
     else:
-        # Continuous target
+        # Continuous target (same as before)
         n_bins = min(10, y_train.nunique())
         if n_bins >= 2:
             y_array = y_train.values.ravel()
             y_binned, bins = pd.qcut(y_array, q=n_bins, labels=False, retbins=True, duplicates='drop')
-            clf = RandomForestClassifier(random_state=RANDOM_STATE)
+            clf = RandomForestClassifier(n_estimators=500, random_state=RANDOM_STATE)
             clf.fit(X_train, y_binned)
             encoder_or_bins = bins
-        # Train regressor on actual continuous target
-        reg = RandomForestRegressor(random_state=RANDOM_STATE)
+        reg = RandomForestRegressor(n_estimators=500, random_state=RANDOM_STATE)
         reg.fit(X_train, y_train.values.ravel())
+
     return clf, reg, encoder_or_bins
 
 def get_top_features(importances, feature_names, top_n=15):
