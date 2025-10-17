@@ -260,48 +260,93 @@ def save_predictions_csv(filename, X, y_true, clf_pred, reg_pred, combined_pred)
     df_out.to_csv(filename, index=False)
 
 def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plots/feature_score_scatter.png"):
-    """
-    Evaluates each feature and all features together using StratifiedKFold and 
-    plots accuracy vs F1. Saves the plot to the specified path.
-    """
     os.makedirs("plots", exist_ok=True)
     results = []
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
+    def normalize_labels(series):
+        return series.astype(str).str.strip().str.lower()
+
+    y_norm = normalize_labels(y)
+
+    # --- Evaluate each single feature ---
     for feat in feature_names:
         acc_scores, f1_scores = [], []
-        for train_idx, test_idx in skf.split(X[[feat]], y):
+        for train_idx, test_idx in skf.split(X[[feat]], y_norm):
             X_train, X_test = X.iloc[train_idx][[feat]], X.iloc[test_idx][[feat]]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+            y_train, y_test = y_norm.iloc[train_idx], y_norm.iloc[test_idx]
+
             model = RandomForestClassifier(n_estimators=100, random_state=42)
             model.fit(X_train, y_train)
             y_pred = model.predict(X_test)
+
             acc_scores.append(accuracy_score(y_test, y_pred))
             f1_scores.append(f1_score(y_test, y_pred, average='macro'))
-        results.append({"Feature": feat, "Accuracy": np.mean(acc_scores), "F1 Score": np.mean(f1_scores)})
 
-    # Evaluate all features together
+        results.append({
+            "Feature": feat,
+            "Accuracy": np.mean(acc_scores),
+            "F1 Score": np.mean(f1_scores)
+        })
+
+    # --- Evaluate all features together ---
     acc_scores, f1_scores = [], []
-    for train_idx, test_idx in skf.split(X[feature_names], y):
+    for train_idx, test_idx in skf.split(X[feature_names], y_norm):
         X_train, X_test = X.iloc[train_idx][feature_names], X.iloc[test_idx][feature_names]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        y_train, y_test = y_norm.iloc[train_idx], y_norm.iloc[test_idx]
+
         model = RandomForestClassifier(n_estimators=100, random_state=42)
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
+
         acc_scores.append(accuracy_score(y_test, y_pred))
         f1_scores.append(f1_score(y_test, y_pred, average='macro'))
-    results.append({"Feature": "All Features", "Accuracy": np.mean(acc_scores), "F1 Score": np.mean(f1_scores)})
 
-    # Plot scatter of Accuracy vs F1
+    results.append({
+        "Feature": "All Features",
+        "Accuracy": np.mean(acc_scores),
+        "F1 Score": np.mean(f1_scores)
+    })
+
+    # --- Baseline: Always predict "moderate" ---
+    baseline_label = "2"  # because Moderate is encoded as 2
+    y_baseline = pd.Series([baseline_label] * len(y_norm))
+    
+    print("Unique normalized labels:", y_norm.unique())
+    print("Baseline first 5 predictions:", y_baseline.head())
+    
+    baseline_acc = accuracy_score(y_norm, y_baseline)
+    baseline_f1 = f1_score(y_norm, y_baseline, average='macro')
+
+    print("Unique labels in dataset:", y_norm.unique())  # ✅ debug check
+
+    results.append({
+        "Feature": "Predict Moderate",
+        "Accuracy": baseline_acc,
+        "F1 Score": baseline_f1
+    })
+
+    # --- Plot ---
     df_results = pd.DataFrame(results)
     plt.figure(figsize=(10, 6))
-    plt.scatter(df_results["Accuracy"], df_results["F1 Score"], c='skyblue', edgecolors='black')
+
+    plt.scatter(df_results["Accuracy"], df_results["F1 Score"],
+                c='skyblue', edgecolors='black', label='Features')
+
+    baseline_row = df_results[df_results["Feature"] == "Predict Moderate"].iloc[0]
+    plt.scatter(baseline_row["Accuracy"], baseline_row["F1 Score"],
+                color='red', s=80, label='Predict Moderate')
+
     for i, row in df_results.iterrows():
-        plt.annotate(row["Feature"], (row["Accuracy"] + 0.001, row["F1 Score"] + 0.001), fontsize=8)
+        plt.annotate(row["Feature"],
+                     (row["Accuracy"] + 0.001, row["F1 Score"] + 0.001),
+                     fontsize=8)
+
     plt.xlabel("Accuracy")
     plt.ylabel("F1 Score")
-    plt.title("Accuracy vs F1 Score for Individual and Combined Predictors")
+    plt.title("Accuracy vs F1 Score (Including Predict-Moderate Baseline)")
     plt.grid(True)
+    plt.legend()
     plt.tight_layout()
     plt.savefig(output_path)
     plt.show()
