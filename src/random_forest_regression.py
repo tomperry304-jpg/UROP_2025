@@ -1,93 +1,465 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Jun 26 10:31:07 2025
+Created on Sat Jul 19 20:18:36 2025
 
 @author: tompe
 """
+
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jul 17 20:01:00 2025
+
+@author: tompe
+"""
+
+"""
+Script to load and merge data from Excel and Parquet files, perform feature 
+selection, train Random Forest models (classifier and regressor), and output 
+predictions and plots.
+
+Usage:
+    python script.py --excel_path <path> --parquet_path <path> [--target TARGET]
+
+Requirements:
+    - pandas
+    - numpy
+    - scikit-learn
+    - matplotlib
+    - seaborn
+"""
+
+import argparse
+import os
+import random
+
+import numpy as np
 import pandas as pd
-
-file_path = r"C:\Users\tompe\OneDrive - Imperial College London\Year 2\UROP\Project\WFD_SW_Classification_Status_and_Objectives_Cycle2_v4.xlsx"
-
-sheets_dict = pd.read_excel(file_path, sheet_name=None)
-
-# Combine all sheets into a single DataFrame with a 'year' column
-df_list = []
-
-for sheet_name, df in sheets_dict.items():
-    df = df.copy()
-    df["year"] = sheet_name  # tag each row with the sheet name (assumed to be the year)
-    df_list.append(df)
-
-# Combine into one big DataFrame
-full_df = pd.concat(df_list, ignore_index=True)
-
-
-
-
- 
-
-X = full_df[["OV_CLASS", "ECO_CLASS", "MMA_CLASS", "year","MOR_CLASS"]]  # include year
-X = X.iloc[1:]
-X = X.dropna()
-
-
-from sklearn.preprocessing import LabelEncoder
-
-for col in X.columns:
-    if X[col].dtype == 'object':
-        X[col] = LabelEncoder().fit_transform(X[col])
-        
-x=X.iloc[:,0:-1]
-y=X.iloc[:,-1]   
-    
-    
-from sklearn.ensemble import RandomForestClassifier
-
-model = RandomForestClassifier()
-model.fit(x,y)
-
-y_pred = model.predict(x)
-
-
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-
-print("R² Score:", r2_score(y, y_pred))
-print("Mean Absolute Error:", mean_absolute_error(y, y_pred))
-print("Mean Squared Error:", mean_squared_error(y, y_pred))
-
 import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import accuracy_score, f1_score
 
-importances = model.feature_importances_
-feature_names = x.columns
+# Set random seeds for reproducibility
+RANDOM_STATE = 42
+random.seed(RANDOM_STATE)
+np.random.seed(RANDOM_STATE)
 
-# Plot
-plt.figure(figsize=(8, 5))
-plt.barh(feature_names, importances)
-plt.xlabel("Feature Importance")
-plt.title("Random Forest Feature Importances")
-plt.show()
 
-keys = {x: y for x,y in zip(full_df.columns, df.iloc[0])}
+def load_excel_data(excel_path):
+    """
+    Load all sheets from the Excel file, concatenate them, and drop columns with >=50% missing values.
+    Skips the second header row which repeats labels.
+    """
+    all_sheets = []
+    try:
+        # Use pandas to get sheet names
+        xls = pd.ExcelFile(excel_path, engine='openpyxl')
+        sheets = xls.sheet_names
+    except Exception as e:
+        raise Exception(f"Error reading Excel file: {e}")
 
-#translate back to catagorys - look at random forrest clasifications
-#mirror % distribution
-#cross validation
-#loop over combinations of dependent and indipendent variables
-#compeare effectivness of combinations
+    for sheet in sheets:
+        # Read sheet, skip the repeated header row at index 1
+        df_sheet = pd.read_excel(excel_path, sheet_name=sheet, skiprows=1, engine='openpyxl')
+        all_sheets.append(df_sheet)
+    if not all_sheets:
+        raise ValueError("No sheets found in Excel file.")
+    # Concatenate all sheets into one DataFrame
+    df_excel = pd.concat(all_sheets, ignore_index=True)
+    # Drop columns with 50% or more missing values
+    thresh = len(df_excel) * 0.5
+    df_excel = df_excel.loc[:, df_excel.isnull().sum() < thresh]
+    return df_excel
 
-from sklearn.metrics import accuracy_score
 
-scores = []
+def load_parquet_data(parquet_path):
+    """
+    Load Parquet file and drop columns with <1,000,000 non-null values.
+    """
+    try:
+        df_parquet = pd.read_parquet(parquet_path)
+    except ImportError:
+        raise ImportError("PyArrow or fastparquet is required to read Parquet files. Install one to proceed.")
+    except Exception as e:
+        raise Exception(f"Error reading Parquet file: {e}")
 
-for iteration in range (10):
-  x_ = x.sample(int(x.shape[0] * 0.9))
-  y_ = y.loc[x_.index]
-  x_test = x.loc[~x.index.isin(x_.index)]
-  y_test = y.loc[x_test.index]
+    # Keep columns with at least 1,000,000 non-null entries
+    non_null_counts = df_parquet.notnull().sum()
+    cols_to_keep = non_null_counts[non_null_counts >= 1000000].index
+    df_parquet = df_parquet.loc[:, cols_to_keep]
+    return df_parquet
+
+
+def aggregate_parquet(df_parquet):
+    """
+    Aggregate WIMS data by wb_id, taking mean of numeric fields.
+    """
+    numeric_cols = df_parquet.select_dtypes(include=np.number).columns.tolist()
+    agg_df = df_parquet.groupby("wb_id")[numeric_cols].mean().reset_index()
+    return agg_df
+
+
+def merge_datasets(df_excel, df_parquet):
+    """
+    Merge the two datasets using 'Water Body ID' from Excel and 'wb_id' from Parquet.
+    """
+    if 'Water Body ID' not in df_excel.columns:
+        raise KeyError("Excel file missing 'Water Body ID'")
+    if 'wb_id' not in df_parquet.columns:
+        raise KeyError("Parquet file missing 'wb_id'")
+
+    # Rename for consistency
+    df_excel = df_excel.rename(columns={"Water Body ID": "wb_id"})
+    df_parquet_agg = aggregate_parquet(df_parquet)
+    # Perform inner join
+    df_merged = pd.merge(df_excel, df_parquet_agg, on="wb_id", how="inner")
+    return df_merged
+
+
+def determine_target_type(series, cat_threshold=15):
+    """
+    Determine if the target series is categorical or continuous.
+    """
+    if pd.api.types.is_numeric_dtype(series):
+        if series.nunique() <= cat_threshold:
+            return "categorical"
+        else:
+            return "continuous"
+    else:
+        return "categorical"
+
+
+def train_models(X_train, y_train, target_type):
+    """
+    Train RandomForestClassifier and RandomForestRegressor on the data.
+    Returns trained classifier, regressor, and encoder/bins info.
+    """
+    clf = None
+    reg = None
+    encoder_or_bins = None
+
+    if target_type == "categorical":
+        # Label-encode y for training
+        le = LabelEncoder()
+        y_encoded = le.fit_transform(y_train.values.ravel())
+        # Train classifier
+        clf = RandomForestClassifier(random_state=RANDOM_STATE)
+        clf.fit(X_train, y_encoded)
+        # Train regressor on the encoded labels
+        reg = RandomForestRegressor(random_state=RANDOM_STATE)
+        reg.fit(X_train, y_encoded)
+        encoder_or_bins = le
+
+    else:
+        # Continuous target
+        # Bin the target into up to 10 bins for classification
+        n_bins = min(10, y_train.nunique())
+        if n_bins >= 2:
+            y_array = y_train.values.ravel()
+            y_binned, bins = pd.qcut(y_array, q=n_bins, labels=False, retbins=True, duplicates='drop')
+            clf = RandomForestClassifier(random_state=RANDOM_STATE)
+            clf.fit(X_train, y_binned)
+            encoder_or_bins = bins
+        # Train regressor on actual continuous target
+        reg = RandomForestRegressor(random_state=RANDOM_STATE)
+        reg.fit(X_train, y_train.values.ravel())
+
+    return clf, reg, encoder_or_bins
+
+
+def get_top_features(importances, feature_names, top_n=15):
+    """
+    Return the top_n feature names based on importance scores.
+    """
+    feat_imp = sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)
+    top_features = [f for f, imp in feat_imp[:top_n]]
+    return top_features, feat_imp[:top_n]
+
+
+def plot_feature_importance(importances, feature_names, output_path, target_name=None):
+    """
+    Plot and save a bar chart of feature importances (top 15).
+    """
+    feats, imps = zip(*sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True))
+    top_feats = list(feats[:15])
+    top_imps = list(imps[:15])
+    plt.figure(figsize=(10, 6))
+    ax = sns.barplot(x=top_imps, y=top_feats, palette='coolwarm')
+    title = "Top 15 Feature Importances"
+    if target_name:
+        title += f" for predicting {target_name}"
+    plt.title(title)
+    plt.xlabel("Importance")
+    plt.ylabel("Feature")
+    # Annotate bars with importance values
+    ax = plt.gca()
+    for p in ax.patches:
+        width = p.get_width()
+        ax.text(width + 0.001, p.get_y() + p.get_height()/2, f"{width:.2f}", va='center')
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path)
+    plt.close()
+
+
+def plot_feature_distributions(df, features, target_name, target_type, output_dir):
+    """
+    Plot and save distribution plots for features.
+    Categorical features: countplot; Continuous: boxplot.
+    Grouped by target variable (or its binned version if continuous).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    df_plot = df.copy()
+    if target_type == "continuous":
+        # Bin the continuous target into 5 categories for grouping
+        n_unique = df_plot[target_name].nunique()
+        n_bins = min(5, n_unique)
+        try:
+            df_plot['target_group'] = pd.qcut(df_plot[target_name], q=n_bins, labels=False, duplicates='drop')
+        except Exception:
+            df_plot['target_group'] = pd.cut(df_plot[target_name], bins=n_bins, labels=False)
+        hue_col = 'target_group'
+    else:
+        hue_col = target_name
+
+    for feat in features:
+        plt.figure(figsize=(8, 6))
+        if pd.api.types.is_numeric_dtype(df_plot[feat]):
+            # Continuous feature: use boxplot
+            sns.boxplot(x=hue_col, y=feat, data=df_plot)
+            title = f"Boxplot of {feat} by {'Target' if target_type=='continuous' else target_name}"
+            plt.title(title)
+            plt.xlabel('Target Bin' if target_type=='continuous' else target_name)
+            plt.ylabel(feat)
+        else:
+            # Categorical feature: use countplot
+            sns.countplot(x=feat, hue=hue_col, data=df_plot)
+            title = f"Countplot of {feat} by {'Target' if target_type=='continuous' else target_name}"
+            plt.title(title)
+            plt.xlabel(feat)
+            plt.ylabel("Count")
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        safe_feat = feat.replace(" ", "_")
+        plot_type = "boxplot" if pd.api.types.is_numeric_dtype(df_plot[feat]) else "countplot"
+        out_file = os.path.join(output_dir, f"{safe_feat}_{plot_type}.png")
+        plt.savefig(out_file)
+
+
+def save_predictions_csv(filename, X, y_true, clf_pred, reg_pred, combined_pred):
+    """
+    Save features, true target, and predictions to CSV.
+    """
+    df_out = X.copy().reset_index(drop=True)
+    df_out['True_Target'] = y_true.values.ravel()
+    df_out['Pred_Classifier'] = clf_pred
+    df_out['Pred_Regressor'] = reg_pred
+    df_out['Pred_Combined'] = combined_pred
+    df_out.to_csv(filename, index=False)
+
+
+def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plots/feature_score_scatter.png"):
+    """
+    Evaluates each feature and all features together using StratifiedKFold and 
+    plots accuracy vs F1. Saves the plot to the specified path.
+    """
+    import os
+    os.makedirs("plots", exist_ok=True)
+
+    results = []
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    for feat in feature_names:
+        acc_scores, f1_scores = [], []
+        for train_idx, test_idx in skf.split(X[[feat]], y):
+            X_train, X_test = X.iloc[train_idx][[feat]], X.iloc[test_idx][[feat]]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+            model = RandomForestClassifier(n_estimators=100, random_state=42)
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            acc_scores.append(accuracy_score(y_test, y_pred))
+            f1_scores.append(f1_score(y_test, y_pred, average='macro'))
+        results.append({"Feature": feat, "Accuracy": np.mean(acc_scores), "F1 Score": np.mean(f1_scores)})
+
+    # Evaluate all features together
+    acc_scores, f1_scores = [], []
+    for train_idx, test_idx in skf.split(X[feature_names], y):
+        X_train, X_test = X.iloc[train_idx][feature_names], X.iloc[test_idx][feature_names]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        model = RandomForestClassifier(n_estimators=100, random_state=42)
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        acc_scores.append(accuracy_score(y_test, y_pred))
+        f1_scores.append(f1_score(y_test, y_pred, average='macro'))
+    results.append({"Feature": "All Features", "Accuracy": np.mean(acc_scores), "F1 Score": np.mean(f1_scores)})
+
+    # Plot
+    df_results = pd.DataFrame(results)
+    plt.figure(figsize=(10, 6))
+    plt.scatter(df_results["Accuracy"], df_results["F1 Score"], c='skyblue', edgecolors='black')
+    for i, row in df_results.iterrows():
+        plt.annotate(row["Feature"], (row["Accuracy"] + 0.001, row["F1 Score"] + 0.001), fontsize=8)
+    plt.xlabel("Accuracy")
+    plt.ylabel("F1 Score")
+    plt.title("Accuracy vs F1 Score for Individual and Combined Predictors")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.show()
+    print(f"Scatter plot saved as '{output_path}'")
+
+
+def main(args):
+    # Load data
+    df_excel = load_excel_data(args.excel_path)
+    # Drop "Overall Water Body Class" if it exists
+    df_excel = df_excel.drop(columns=["Overall Water Body Class"], errors="ignore")
+    print(f"Excel data: {df_excel.shape} (rows, columns)")
+    df_parquet = load_parquet_data(args.parquet_path)
+    print(f"Parquet data: {df_parquet.shape} (rows, columns)")
     
+    print("Excel columns:", df_excel.columns.tolist())
+    print("Parquet columns:", df_parquet.columns.tolist())
     
-  model.fit(x_,y_)
-  y_pred = model.predict(x_test)
-  
-  acc = accuracy_score(y_test, y_pred)
-  scores.append(acc)
+    # Merge on common keys
+    df_merged = merge_datasets(df_excel, df_parquet)
+    print(f"Merged data: {df_merged.shape} (rows, columns)")
+
+    target = args.target
+    if target not in df_merged.columns:
+        raise ValueError(f"Target '{target}' not in merged data.")
+
+    # Drop rows with missing target
+    df_merged = df_merged.dropna(subset=[target]).reset_index(drop=True)
+    X = df_merged.drop(columns=[target])
+    for col in X.select_dtypes(include=['object', 'category']).columns:
+        X[col] = X[col].astype(str)
+        X[col] = LabelEncoder().fit_transform(X[col])
+    
+    y = df_merged[[target]]
+
+    # Determine target type
+    target_type = determine_target_type(y[target])
+    print(f"Target '{target}' is detected as {target_type}.")
+
+    # Split into train/test
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=RANDOM_STATE)
+    print(f"Train size: {X_train.shape[0]}, Test size: {X_test.shape[0]}")
+
+    # Train initial models on all features
+    clf, reg, encoder_or_bins = train_models(X_train, y_train, target_type)
+
+    # Feature importances from classifier or regressor
+    if target_type == "categorical" and clf is not None:
+        importances = clf.feature_importances_
+        feature_names = X_train.columns
+    elif reg is not None:
+        importances = reg.feature_importances_
+        feature_names = X_train.columns
+    else:
+        raise ValueError("No valid model to determine feature importances.")
+
+    # Select top 15 features
+    top_feats, top_importances = get_top_features(importances, feature_names, top_n=15)
+    print("Top 15 features:")
+    if target_type == "categorical":
+        le = LabelEncoder()
+        y_test_enc = le.fit_transform(y_test.values.ravel())
+    else:
+        y_test_enc = y_test.values.ravel()
+    
+    for feat, imp in top_importances:
+        print(f"  {feat}: {imp:.4f}")
+
+    # Correlation matrix of top 15 features
+    os.makedirs("plots", exist_ok=True)
+    corr_df = X[top_feats].dropna()
+    corr_matrix = corr_df.corr()
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap='coolwarm', vmin=-1, vmax=1)
+    plt.title("Pearson Correlation Matrix of Top 15 Features")
+    plt.tight_layout()
+    plt.savefig("plots/correlation_matrix.png")
+    plt.show()
+
+    # Cross-validation accuracy boxplot (5-fold StratifiedKFold)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    clf_cv = RandomForestClassifier(random_state=RANDOM_STATE)
+    scores = cross_val_score(clf_cv, X[top_feats], y.values.ravel(), cv=skf, scoring='accuracy')
+    plt.figure(figsize=(6, 6))
+    sns.boxplot(y=scores, color='lightgreen')
+    plt.title("5-fold Cross-validation Accuracy")
+    plt.ylabel("Accuracy")
+    plt.tight_layout()
+    plt.savefig("plots/cv_accuracy_boxplot.png")
+    plt.show()
+
+    # Plot feature importances (highlighting top features for target prediction)
+    plot_feature_importance(importances, feature_names, "plots/feature_importance.png", target)
+    print("Feature importance plot saved as 'plots/feature_importance.png'.")
+
+    # Subset data to top features
+    X_train_sel = X_train[top_feats]
+    X_test_sel = X_test[top_feats]
+
+    # Retrain models on selected features
+    clf2, reg2, encoder_or_bins2 = train_models(X_train_sel, y_train, target_type)
+
+    # Predictions
+    if target_type == "categorical":
+        # Predict class (encoded)
+        clf_pred_enc = clf2.predict(X_test_sel)
+        reg_pred = reg2.predict(X_test_sel)
+        # Combine predictions: average and round
+        avg_pred = 0.5 * (clf_pred_enc + reg_pred)
+        combined_num = np.rint(avg_pred).astype(int)
+        # Clip to valid range
+        le = encoder_or_bins  # LabelEncoder from train
+        combined_num = np.clip(combined_num, 0, len(le.classes_) - 1)
+        final_pred = le.inverse_transform(combined_num)
+        clf_pred = le.inverse_transform(clf_pred_enc)
+        # Keep reg_pred numeric as float (predicted encoded class values)
+    else:
+        # Continuous target
+        reg_pred = reg2.predict(X_test_sel)
+        if clf2 is not None:
+            # Map classifier's binned predictions to numeric via median of bins
+            clf_pred_bins = clf2.predict(X_test_sel)
+            df_temp = pd.DataFrame({'target': y_train.values.ravel()})
+            n_bins = len(np.unique(clf_pred_bins))
+            df_temp['bin'], bins = pd.qcut(df_temp['target'], q=n_bins, labels=False, retbins=True, duplicates='drop')
+            bin_medians = df_temp.groupby('bin')['target'].median().to_dict()
+            class_pred_numeric = np.array([bin_medians.get(b, np.nan) for b in clf_pred_bins])
+            final_pred = 0.5 * (class_pred_numeric + reg_pred)
+            clf_pred = clf_pred_bins
+        else:
+            final_pred = reg_pred
+            clf_pred = [None] * len(reg_pred)
+
+    # Save predictions and true labels
+    save_predictions_csv("model_predictions.csv", X_test_sel, y_test, clf_pred, reg_pred, final_pred)
+    print("Predictions saved to 'model_predictions.csv'.")
+
+    # Plot feature distributions on the merged dataset for top features
+    df_plot = df_merged[top_feats + [target]].dropna()
+    if target_type == "categorical":
+        df_plot[target] = df_plot[target].astype(str)
+    plot_feature_distributions(df_plot, top_feats, target, target_type, output_dir="feature_plots")
+    print("Feature distribution plots saved to 'feature_plots/' directory.")
+
+    evaluate_and_plot_feature_performance(X_test_sel, pd.Series(y_test_enc), top_feats)
+    return final_pred
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Data processing and modeling")
+    parser.add_argument("--excel_path", type=str,
+                        default="WFD_SW_Classification_Status_and_Objectives_Cycle2_v4.xlsx")
+    parser.add_argument("--parquet_path", type=str,
+                        default="wims_wfd_merged.parquet")
+    parser.add_argument("--target", type=str, default="Ecological Class")
+    args = parser.parse_args()
+    ECO_CLASS = main(args)
+    main(args)
