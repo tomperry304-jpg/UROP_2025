@@ -417,6 +417,11 @@ def main(args):
     df_merged = merge_datasets(df_excel, df_parquet)
     print(f"Merged data before filtering: {df_merged.shape} (rows, columns)")
 
+    # 🔹 Remove rows where Ecological Class is "Not Assessed"
+    target = args.target
+    df_merged = df_merged[df_merged[target].astype(str).str.lower().str.strip() != "not assessed"]
+    print(f"Merged data after removing 'Not Assessed': {df_merged.shape} (rows, columns)")
+
     # Keep only the target column from Excel and chemical features from Parquet
     target_col = args.target
     df_excel = df_excel.rename(columns={'Water Body ID': 'wb_id'})
@@ -477,6 +482,12 @@ def main(args):
         df_model = df_model.drop(columns=['wb_id'])
     X = df_model.drop(columns=[target]).copy()
     y = df_model[target].copy()
+    
+    # 🔹 Remove any "Not assessed" rows from training data
+    mask = y.astype(str).str.lower().str.strip() != "not assessed"
+    X = X[mask].reset_index(drop=True)
+    y = y[mask].reset_index(drop=True)
+    
 
     # Debugging shape and type information
     print("X shape:", X.shape)
@@ -641,11 +652,47 @@ def main(args):
     # Retrain models on selected top features
     clf2, reg2, encoder_or_bins2 = train_models(X_train_sel, y_train, target_type)
 
-    # Make predictions on test set using both models
+    # --- LightGBM Classifier ---
+    from lightgbm import LGBMClassifier
+    from sklearn.metrics import accuracy_score, f1_score
+
+    lgbm_pred = None  # Initialize for later use
+
+    if target_type == "categorical":
+        lgbm = LGBMClassifier(
+            n_estimators=1000,
+            learning_rate=0.05,
+            num_leaves=31,
+            class_weight='balanced',
+            random_state=RANDOM_STATE
+            )
+        lgbm.fit(X_train_sel, y_train)
+        lgbm_pred = lgbm.predict(X_test_sel)
+
+        acc = accuracy_score(y_test, lgbm_pred)
+        f1 = f1_score(y_test, lgbm_pred, average='macro')
+
+        print(f"LightGBM Test Accuracy: {acc:.4f}")
+        print(f"LightGBM Macro F1: {f1:.4f}")
+        # Make predictions on test set using both models
+        
     if target_type == "categorical":
         # Classifier predicted classes (encoded) and regressor predictions (encoded)
         clf_pred_enc = clf2.predict(X_test_sel)
         reg_pred = reg2.predict(X_test_sel)
+        
+        ensemble_pred = None
+        if target_type == "categorical" and lgbm_pred is not None:
+            rf_pred = clf2.predict(X_test_sel)  # RF prediction in label-encoded form
+            ensemble_pred = np.where(rf_pred == lgbm_pred, rf_pred, lgbm_pred)
+
+            acc_ens = accuracy_score(y_test, ensemble_pred)
+            f1_ens = f1_score(y_test, ensemble_pred, average='macro')
+
+            print(f"Ensemble Accuracy: {acc_ens:.4f}")
+            print(f"Ensemble Macro F1: {f1_ens:.4f}")
+        
+        
         # Combine classifier and regressor predictions (average) and round to nearest class
         avg_pred = 0.5 * (clf_pred_enc + reg_pred)
         combined_num = np.rint(avg_pred).astype(int)
@@ -676,8 +723,14 @@ def main(args):
             clf_pred = [None] * len(reg_pred)
 
     # Save predictions and true labels to CSV
-    save_predictions_csv("model_predictions.csv", X_test_sel, y_test, clf_pred, reg_pred, final_pred)
-    print("Predictions saved to 'model_predictions.csv'.")
+    save_predictions_csv(
+        "model_predictions.csv",
+        X_test_sel,
+        y_test,
+        clf_pred,  # RF predictions
+        reg_pred,
+        ensemble_pred if ensemble_pred is not None else final_pred  # Use ensemble if available
+    )
 
     # Plot feature distributions for top features on entire dataset
     df_plot = X[top_feats].copy()
