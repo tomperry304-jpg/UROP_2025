@@ -454,7 +454,100 @@ def main(args):
     print("Feature distribution plots saved to 'feature_plots/' directory.")
 
     evaluate_and_plot_feature_performance(X_test_sel, pd.Series(y_test_enc), top_feats)
-    return final_pred
+    #return final_pred
+    model_used = clf2 if target_type == "categorical" else reg2
+    return final_pred, model_used, X_train_sel, top_feats
+
+
+from sklearn.inspection import partial_dependence, PartialDependenceDisplay
+from sklearn.base import is_classifier
+
+
+def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
+    """
+    Generate Partial Dependence Plots for the top_n features of the model 
+    and provide simple trend-based textual explanations of feature effects on the target.
+    """
+    # Ensure feature_names list
+    if feature_names is None:
+        try:
+            feature_names = list(X.columns)
+        except Exception:
+            feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+    # Determine top features by importance if available
+    if hasattr(model, "feature_importances_"):
+        importances = model.feature_importances_
+        top_idx = np.argsort(importances)[::-1][:top_n]
+    else:
+        top_idx = np.arange(min(top_n, X.shape[1]))
+    top_features = [feature_names[i] for i in top_idx]
+    
+    is_class = is_classifier(model)
+    numeric_classes = False
+    if is_class:
+        try:
+            classes = model.classes_
+            numeric_classes = np.issubdtype(classes.dtype, np.number)
+        except Exception:
+            numeric_classes = False
+    
+    explanations = []
+    # Loop through each top feature
+    for idx, fname in zip(top_idx, top_features):
+        # Compute partial dependence (average)
+        try:
+            pdp_res = partial_dependence(model, X, [idx], feature_names=feature_names, kind='average')
+        except TypeError:
+            pdp_res = partial_dependence(model, X, [idx], feature_names=feature_names)
+        # Extract grid values and average predictions
+        if "values" in pdp_res:
+            grid = pdp_res["values"][0]
+        else:
+            grid = pdp_res["grid_values"][0]
+        avg_data = pdp_res["average"]
+        if avg_data.ndim > 1:
+            avg_preds = np.ravel(avg_data[0])
+        else:
+            avg_preds = np.ravel(avg_data)
+        
+        # Interpret trend
+        diff = np.diff(avg_preds)
+        if np.all(diff >= 0):
+            trend = f"as {fname} increases, predicted {target_name} tends to increase"
+        elif np.all(diff <= 0):
+            trend = f"as {fname} increases, predicted {target_name} tends to decrease"
+        else:
+            if np.allclose(avg_preds, avg_preds[0], atol=1e-3):
+                trend = f"{fname} has little effect on {target_name}"
+            else:
+                trend = f"{fname} has a non-monotonic effect on {target_name}"
+        explanations.append(f"Feature '{fname}': {trend}.")
+        
+        # Plot the partial dependence
+        try:
+            display = PartialDependenceDisplay.from_estimator(model, X, [idx], feature_names=feature_names)
+            # Label the plot
+            # The axes_ array is 2D even for one feature; access first element
+            ax = display.axes_[0][0] if hasattr(display.axes_, 'shape') else display.axes_[0]
+            ax.set_title(f"PDP of {fname}")
+            plt.tight_layout()
+            plt.show()
+        except Exception:
+            # Fallback manual plot if needed
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(grid, avg_preds, marker='o')
+            ax.set_xlabel(fname)
+            ax.set_ylabel(target_name)
+            ax.set_title(f"PDP of {fname}")
+            plt.tight_layout()
+            plt.show()
+    
+    # Print textual explanations
+    print("\n".join(explanations))
+
+
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Data processing and modeling")
@@ -464,5 +557,33 @@ if __name__ == "__main__":
                         default="wims_wfd_merged.parquet")
     parser.add_argument("--target", type=str, default="Ecological Class")
     args = parser.parse_args()
-    ECO_CLASS = main(args)
-    main(args)
+    
+    ECO_CLASS, model, X_train_used, feature_names_used = main(args)
+    explain_model(model, X_train_used, feature_names=feature_names_used, target_name=args.target, top_n=15)
+    
+#multi varaible pdp plots
+#only using chemicl data
+# presentations    
+
+
+
+
+
+
+"""
+import pandas as pd
+# Load the data
+wims_wfd_merged = pd.read_parquet(r"\path\to\wims_wfd_merged.parquet")
+
+# Use only the (e.g.,) variables with > million samples
+counts = wims_wfd_merged.variable.value_counts()
+counts = counts[counts>1e6]
+wims_wfd_merged = wims_wfd_merged.loc[wims_wfd_merged.variable.isin(counts.index)]
+
+# Aggregate data to catchment-year-variable scale (try varying from mean, median, quantile)
+grouped = wims_wfd_merged.groupby(["wb_id","year","variable"]).result.mean().reset_index()
+
+# Format for sklearn
+pivoted = grouped.pivot(index=["wb_id","year"],columns=["variable"],values="result")
+print(pivoted.reset_index())
+"""
