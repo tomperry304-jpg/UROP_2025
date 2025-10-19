@@ -925,7 +925,7 @@ def main():
     parser.add_argument("--target", type=str, default="Ecological Class")
     args = parser.parse_args()
 
-    if False:
+    if True:
         df_classified_chem_data = process_and_aggregate(args)
         df_classified_chem_data.to_parquet("process_input.parquet", index=False)
     else:
