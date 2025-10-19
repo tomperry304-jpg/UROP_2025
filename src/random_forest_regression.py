@@ -6,21 +6,32 @@ Created on Sat Jul 26 18:28:04 2025
 """
 
 import argparse
+import logging
 import os
 import random
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder, OneHotEncoder, OrdinalEncoder
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
-from sklearn.metrics import accuracy_score, f1_score
-from scipy.sparse import csr_matrix, hstack
-from sklearn.model_selection import GridSearchCV
 from lightgbm import LGBMClassifier
+from scipy.sparse import csr_matrix, hstack
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import (
+    GridSearchCV,
+    StratifiedKFold,
+    cross_val_score,
+    train_test_split,
+)
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder, OrdinalEncoder
 
+LOGGER = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    level=logging.INFO,
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 
 RANDOM_STATE = 42
@@ -202,7 +213,7 @@ def train_models(X_train, y_train, target_type):
         grid.fit(X_train, y_encoded)
 
         clf = grid.best_estimator_
-        print("Best RandomForest params:", grid.best_params_)
+        LOGGER.info("Best RandomForest params: %s", grid.best_params_)
 
 
         reg = RandomForestRegressor(
@@ -304,32 +315,6 @@ def plot_feature_distributions(df, features, target_name, target_type, output_di
         plot_type = "boxplot" if pd.api.types.is_numeric_dtype(df_plot[feat]) else "countplot"
         out_file = os.path.join(output_dir, f"{safe_feat}_{plot_type}.png")
         plt.savefig(out_file)
-"""
-def save_predictions_csv(filename, X, y_true, clf_pred, reg_pred, combined_pred):
-
-    if isinstance(X, np.ndarray):
-        X = pd.DataFrame(X)
-        
-    df_out = X.copy().reset_index(drop=True)
-    df_out['True_Target'] = y_true.values.ravel()
-    df_out['Pred_Classifier'] = clf_pred
-    df_out['Pred_Regressor'] = reg_pred
-    df_out['Pred_Combined'] = combined_pred
-    df_out.to_csv(filename, index=False)
-"""
-"""
-def save_predictions_csv(filename, wb_ids, y_true, clf_pred, reg_pred, combined_pred):
-
-    import pandas as pd
-    df_out = pd.DataFrame({
-        "wb_id": pd.Series(wb_ids).astype(str).str.strip().str.upper(),
-        "True_Target": pd.Series(y_true).values.ravel(),
-        "Pred_Classifier": pd.Series(clf_pred),
-        "Pred_Regressor": pd.Series(reg_pred),
-        "Pred_Combined": pd.Series(combined_pred),
-    })
-    df_out.to_csv(filename, index=False)
-"""
 
 def save_predictions_csv(filename, wb_ids, y_true, clf_pred, reg_pred, combined_pred):
     """Write predictions with a stable join key for the map."""
@@ -420,13 +405,13 @@ def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plot
     baseline_label = "2"
     y_baseline = pd.Series([baseline_label] * len(y_norm))
     
-    print("Unique normalized labels:", y_norm.unique())
-    print("Baseline first 5 predictions:", y_baseline.head())
+    LOGGER.info("Unique normalized labels: %s", y_norm.unique())
+    LOGGER.info("Baseline first 5 predictions: %s", y_baseline.head())
     
     baseline_acc = accuracy_score(y_norm, y_baseline)
     baseline_f1 = f1_score(y_norm, y_baseline, average='macro')
 
-    print("Unique labels in dataset:", y_norm.unique())
+    LOGGER.info("Unique labels in dataset: %s", y_norm.unique())
 
     results.append({
         "Feature": "Predict Moderate",
@@ -458,20 +443,20 @@ def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plot
     plt.tight_layout()
     plt.savefig(output_path)
     plt.show()
-    print(f"Scatter plot saved as '{output_path}'")
+    LOGGER.info(f"Scatter plot saved as '{output_path}'")
 
 def main(args):
 
     df_excel = load_excel_data(args.excel_path)
 
     df_excel = df_excel.drop(columns=["Overall Water Body Class"], errors="ignore")
-    print(f"Excel data: {df_excel.shape} (rows, columns)")
+    LOGGER.info(f"Excel data: {df_excel.shape} (rows, columns)")
     df_parquet = load_parquet_data(args.parquet_path)
-    print(f"Parquet data: {df_parquet.shape} (rows, columns)")
+    LOGGER.info(f"Parquet data: {df_parquet.shape} (rows, columns)")
 
 
     df_merged = merge_datasets(df_excel, df_parquet)
-    print(f"Merged data before filtering: {df_merged.shape} (rows, columns)")
+    LOGGER.info(f"Merged data before filtering: {df_merged.shape} (rows, columns)")
 
 
     target_col = args.target
@@ -488,8 +473,8 @@ def main(args):
     var_counts = df_parquet['variable'].value_counts()
     frequent_vars = var_counts[var_counts > 1e6].index.tolist()
 
-    print(f"Found {len(frequent_vars)} frequent variables with > 1M records")
-    print("Sample:", frequent_vars[:5])
+    LOGGER.info(f"Found {len(frequent_vars)} frequent variables with > 1M records")
+    LOGGER.info("Sample: %s", frequent_vars[:5])
     
 
     df_filtered = df_parquet[df_parquet['variable'].isin(frequent_vars)]
@@ -510,14 +495,6 @@ def main(args):
 
     df_merged = df_merged.dropna()
     
-    """
-    chemical_subset = df_merged[['wb_id', args.target] + chemical_cols].dropna(subset=[args.target])
-    chemical_subset = chemical_subset.dropna()
-    print(f"Merged data after filtering chemical variables: {chemical_subset.shape} (rows, columns)")
-    print("Chemical columns found:", len(chemical_cols))
-    print("Sample chemical columns:", chemical_cols[:5])
-    df_merged = chemical_subset
-    """
     target = args.target
     if isinstance(target, list):
         target = target[0]
@@ -540,19 +517,15 @@ def main(args):
     y = y[mask].reset_index(drop=True)
     wb_ids = wb_ids_all[mask].reset_index(drop=True)
 
-    print("X shape:", X.shape)
-    print("y shape:", y.shape)
-    print("Index match:", X.index.equals(y.index))
-    print(f"Target '{target}' type:", type(y.iloc[0]))
+    LOGGER.info("X shape: %s", X.shape)
+    LOGGER.info("y shape: %s", y.shape)
+    LOGGER.info("Index match: %s", X.index.equals(y.index))
+    LOGGER.info(f"Target '{target}' type: %s", type(y.iloc[0]))
 
 
     target_type = determine_target_type(y)
-    print(f"Target '{target}' is detected as {target_type}.")
+    LOGGER.info(f"Target '{target}' is detected as {target_type}.")
 
-    """
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE)
-    print(f"Train size: {X_train.shape[0]}, Test size: {X_test.shape[0]}")
-    """
     X_train, X_test, y_train, y_test, wb_train, wb_test = train_test_split(
     X, y, wb_ids, test_size=0.2, random_state=RANDOM_STATE
     )
@@ -630,7 +603,7 @@ def main(args):
 
 
     top_feats, top_importances = get_top_features(importances, feature_names, top_n=15)
-    print("Top 15 features:")
+    LOGGER.info("Top 15 features:")
 
     if target_type == "categorical":
         le_temp = LabelEncoder()
@@ -638,7 +611,7 @@ def main(args):
     else:
         y_test_enc = y_test.values.ravel()
     for feat, imp in top_importances:
-        print(f"  {feat}: {imp:.4f}")
+        LOGGER.info(f"  {feat}: {imp:.4f}")
 
 
     if high_cat_cols:
@@ -647,7 +620,7 @@ def main(args):
         try:
             X[high_cat_cols] = ord_enc.transform(X[high_cat_cols])
         except Exception as e:
-            print(f"Warning: could not ordinal-encode all high-cardinality features: {e}")
+            LOGGER.info(f"Warning: could not ordinal-encode all high-cardinality features: {e}")
 
     for feat in top_feats:
         if feat not in X.columns:
@@ -683,7 +656,7 @@ def main(args):
 
 
     plot_feature_importance(importances, feature_names, "plots/feature_importance.png", target)
-    print("Feature importance plot saved as 'plots/feature_importance.png'.")
+    LOGGER.info("Feature importance plot saved as 'plots/feature_importance.png'.")
 
 
     feat_index_map = {name: idx for idx, name in enumerate(feature_names_enc)}
@@ -738,8 +711,8 @@ def main(args):
         acc = accuracy_score(y_test, lgbm_pred)
         f1 = f1_score(y_test, lgbm_pred, average='macro')
 
-        print(f"LightGBM Test Accuracy: {acc:.4f}")
-        print(f"LightGBM Macro F1: {f1:.4f}")
+        LOGGER.info(f"LightGBM Test Accuracy: {acc:.4f}")
+        LOGGER.info(f"LightGBM Macro F1: {f1:.4f}")
 
         
     if target_type == "categorical":
@@ -755,8 +728,8 @@ def main(args):
             acc_ens = accuracy_score(y_test, ensemble_pred)
             f1_ens = f1_score(y_test, ensemble_pred, average='macro')
 
-            print(f"Ensemble Accuracy: {acc_ens:.4f}")
-            print(f"Ensemble Macro F1: {f1_ens:.4f}")
+            LOGGER.info(f"Ensemble Accuracy: {acc_ens:.4f}")
+            LOGGER.info(f"Ensemble Macro F1: {f1_ens:.4f}")
         
         
         
@@ -818,23 +791,23 @@ def main(args):
             if feat not in df_model.columns:
                 df_plot[feat] = df_plot[feat].astype('category')
     plot_feature_distributions(df_plot, top_feats, target, target_type, output_dir="feature_plots")
-    print("Feature distribution plots saved to 'feature_plots/' directory.")
+    LOGGER.info("Feature distribution plots saved to 'feature_plots/' directory.")
 
 
     evaluate_and_plot_feature_performance(X_test_sel, pd.Series(y_test_enc), top_feats)
     model_used = clf2 if target_type == "categorical" else reg2
     return final_pred, model_used, X_train_sel, top_feats
 
-from sklearn.inspection import partial_dependence, PartialDependenceDisplay
 from sklearn.base import is_classifier
+from sklearn.inspection import PartialDependenceDisplay, partial_dependence
 
 
 def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
+    import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
-    from sklearn.inspection import partial_dependence, PartialDependenceDisplay
     from sklearn.base import is_classifier
-    import matplotlib.pyplot as plt
+    from sklearn.inspection import PartialDependenceDisplay, partial_dependence
 
     # --- make X a DataFrame so .sample works and names align ---
     if isinstance(X, np.ndarray):
@@ -869,7 +842,7 @@ def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
         for f1, f2 in PDP_2D_PAIRS:
             if f1 in feature_names and f2 in feature_names:
                 idx1, idx2 = feature_names.index(f1), feature_names.index(f2)
-                print(f"\nGenerating 2D PDP for features: {f1} and {f2}")
+                LOGGER.info(f"\nGenerating 2D PDP for features: {f1} and {f2}")
 
                 X_pdp = X_df
                 if len(X_pdp) > 2000:
@@ -895,11 +868,11 @@ def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
                     out_file = f"plots/pdp_2d_{f1}_{f2}.png"
                     plt.savefig(out_file, bbox_inches="tight")
                     plt.close()
-                    print(f"2D PDP saved as {out_file}")
+                    LOGGER.info(f"2D PDP saved as {out_file}")
 
                 except Exception as e:
 
-                    print(f" Skipped 2D PDP for {f1} & {f2}: {e}")
+                    LOGGER.info(f" Skipped 2D PDP for {f1} & {f2}: {e}")
                     try:
                         pdp_res_2d = partial_dependence(
                             model,
@@ -921,9 +894,9 @@ def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
                         out_file = f"plots/pdp_2d_{f1}_{f2}_fallback.png"
                         plt.savefig(out_file, bbox_inches="tight")
                         plt.close()
-                        print(f"2D PDP saved (fallback) as {out_file}")
+                        LOGGER.info(f"2D PDP saved (fallback) as {out_file}")
                     except Exception as ee:
-                        print(f"Failed 2D PDP fallback for {f1} & {f2}: {ee}")
+                        LOGGER.info(f"Failed 2D PDP fallback for {f1} & {f2}: {ee}")
 
 
 
@@ -965,9 +938,10 @@ def save_1d_pdp_plots(
         are plotted; otherwise all classes are plotted.
     """
     import os
+
+    import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
-    import matplotlib.pyplot as plt
     from sklearn.inspection import PartialDependenceDisplay
 
 
@@ -1110,15 +1084,6 @@ if __name__ == "__main__":
     os.makedirs("model_predictions", exist_ok=True)
     out_path = os.path.join("model_predictions", "final_predictions.csv")
 
-    """
-    if isinstance(final_pred, (pd.DataFrame, pd.Series)):
-        final_pred.to_csv(out_path, index=False)
-    else:
-
-        pd.DataFrame(final_pred).to_csv(out_path, index=False)
-
-    print(f"Final predictions saved to {out_path}")
-    """
     explain_model(model, X_train_used, feature_names=feature_names_used, target_name=args.target, top_n=15)
 
     save_1d_pdp_plots(
