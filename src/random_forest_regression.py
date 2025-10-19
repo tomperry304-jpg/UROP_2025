@@ -14,9 +14,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from lightgbm import LGBMClassifier
 from scipy.sparse import csr_matrix, hstack
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.inspection import PartialDependenceDisplay, partial_dependence
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import (
     GridSearchCV,
@@ -44,27 +44,18 @@ PDP_2D_PAIRS = [
     ("Ammonia(N)", "Orthophospht"),
     ("pH", "Temp Water"),
     ("Nitrate-N", "N Oxidised"),
-
-
     ("Temp Water", "Ammonia(N)"),
     ("Temp Water", "Nitrate-N"),
-
-
     ("Orthophospht", "Nitrate-N"),
     ("Ammonia(N)", "N Oxidised"),
-
-
     ("Dissolved Oxygen", "Ammonia(N)"),
     ("Dissolved Oxygen", "Orthophospht"),
-
-
     ("pH", "Ammonia(N)"),
     ("pH", "N Oxidised"),
-
-
     ("Suspended Solids", "Orthophospht"),
     ("Conductivity", "Nitrate-N"),
-    ]
+]
+
 
 def load_excel_data(excel_path):
     """
@@ -73,14 +64,16 @@ def load_excel_data(excel_path):
     """
     all_sheets = []
     try:
-        xls = pd.ExcelFile(excel_path, engine='openpyxl')
+        xls = pd.ExcelFile(excel_path, engine="openpyxl")
         sheets = xls.sheet_names
     except Exception as e:
         raise Exception(f"Error reading Excel file: {e}")
 
     for sheet in sheets:
         # Read sheet, skip the repeated header row at index 1
-        df_sheet = pd.read_excel(excel_path, sheet_name=sheet, skiprows=1, engine='openpyxl')
+        df_sheet = pd.read_excel(
+            excel_path, sheet_name=sheet, skiprows=1, engine="openpyxl"
+        )
         all_sheets.append(df_sheet)
     if not all_sheets:
         raise ValueError("No sheets found in Excel file.")
@@ -90,6 +83,7 @@ def load_excel_data(excel_path):
     df_excel = df_excel.loc[:, df_excel.isnull().sum() < thresh]
     return df_excel
 
+
 def load_parquet_data(parquet_path):
     """
     Load Parquet file and drop columns with <1,000,000 non-null values.
@@ -97,7 +91,9 @@ def load_parquet_data(parquet_path):
     try:
         df_parquet = pd.read_parquet(parquet_path)
     except ImportError:
-        raise ImportError("PyArrow or fastparquet is required to read Parquet files. Install one to proceed.")
+        raise ImportError(
+            "PyArrow or fastparquet is required to read Parquet files. Install one to proceed."
+        )
     except Exception as e:
         raise Exception(f"Error reading Parquet file: {e}")
 
@@ -114,18 +110,30 @@ def aggregate_parquet(df_parquet):
     """
     numeric_cols = df_parquet.select_dtypes(include=np.number).columns.tolist()
 
-
     agg_df = df_parquet.groupby("wb_id")[numeric_cols].agg(
-        ['mean', 'median', 'std', 'min', 'max',
-         lambda x: x.quantile(0.25),  # Q1
-         lambda x: x.quantile(0.75)]  # Q3
+        [
+            "mean",
+            "median",
+            "std",
+            "min",
+            "max",
+            lambda x: x.quantile(0.25),  # Q1
+            lambda x: x.quantile(0.75),
+        ]  # Q3
     )
 
-
-    agg_df.columns = ['_'.join(col).strip() if isinstance(col, tuple) else col for col in agg_df.columns]
-    agg_df = agg_df.rename(columns={
-        **{col: col.replace('<lambda_0>', 'Q1').replace('<lambda_1>', 'Q3') for col in agg_df.columns}
-    })
+    agg_df.columns = [
+        "_".join(col).strip() if isinstance(col, tuple) else col
+        for col in agg_df.columns
+    ]
+    agg_df = agg_df.rename(
+        columns={
+            **{
+                col: col.replace("<lambda_0>", "Q1").replace("<lambda_1>", "Q3")
+                for col in agg_df.columns
+            }
+        }
+    )
 
     # Compute IQR = Q3 - Q1
     for num_col in numeric_cols:
@@ -134,44 +142,62 @@ def aggregate_parquet(df_parquet):
         if q1_col in agg_df.columns and q3_col in agg_df.columns:
             agg_df[f"{num_col}_IQR"] = agg_df[q3_col] - agg_df[q1_col]
 
+    df_parquet["dynamic_threshold"] = df_parquet.groupby("variable")[
+        "result"
+    ].transform(lambda x: x.mean() + 2 * x.std())
+    df_parquet["above_threshold"] = (
+        df_parquet["result"] > df_parquet["dynamic_threshold"]
+    ).astype(int)
 
-    df_parquet['dynamic_threshold'] = df_parquet.groupby('variable')['result'].transform(
-        lambda x: x.mean() + 2*x.std()
+    agg_extra = (
+        df_parquet.groupby("wb_id")["above_threshold"]
+        .agg(["sum", "mean"])
+        .reset_index()
     )
-    df_parquet['above_threshold'] = (df_parquet['result'] > df_parquet['dynamic_threshold']).astype(int)
+    agg_extra.rename(
+        columns={"sum": "count_above_thr", "mean": "prop_above_thr"}, inplace=True
+    )
 
-    agg_extra = df_parquet.groupby('wb_id')['above_threshold'].agg(['sum', 'mean']).reset_index()
-    agg_extra.rename(columns={'sum': 'count_above_thr', 'mean': 'prop_above_thr'}, inplace=True)
-
-    if 'date' in df_parquet.columns:
-        df_parquet['ordinal_time'] = pd.to_datetime(df_parquet['date']).map(pd.Timestamp.toordinal)
-        slope_df = df_parquet.groupby('wb_id').apply(
-            lambda g: np.polyfit(g['ordinal_time'], g['result'], 1)[0] if len(g)>1 else 0
-        ).reset_index(name='trend_slope')
+    if "date" in df_parquet.columns:
+        df_parquet["ordinal_time"] = pd.to_datetime(df_parquet["date"]).map(
+            pd.Timestamp.toordinal
+        )
+        slope_df = (
+            df_parquet.groupby("wb_id")
+            .apply(
+                lambda g: np.polyfit(g["ordinal_time"], g["result"], 1)[0]
+                if len(g) > 1
+                else 0
+            )
+            .reset_index(name="trend_slope")
+        )
     else:
-        slope_df = pd.DataFrame({'wb_id': df_parquet['wb_id'].unique(), 'trend_slope': 0})
+        slope_df = pd.DataFrame(
+            {"wb_id": df_parquet["wb_id"].unique(), "trend_slope": 0}
+        )
 
     agg_df = agg_df.reset_index()
-    agg_df = agg_df.merge(agg_extra, on='wb_id', how='left')
-    agg_df = agg_df.merge(slope_df, on='wb_id', how='left')
+    agg_df = agg_df.merge(agg_extra, on="wb_id", how="left")
+    agg_df = agg_df.merge(slope_df, on="wb_id", how="left")
 
     return agg_df
+
 
 def merge_datasets(df_excel, df_parquet):
     """
     Merge the two datasets using 'Water Body ID' from Excel and 'wb_id' from Parquet.
     """
-    if 'Water Body ID' not in df_excel.columns:
+    if "Water Body ID" not in df_excel.columns:
         raise KeyError("Excel file missing 'Water Body ID'")
-    if 'wb_id' not in df_parquet.columns:
+    if "wb_id" not in df_parquet.columns:
         raise KeyError("Parquet file missing 'wb_id'")
-
 
     df_excel = df_excel.rename(columns={"Water Body ID": "wb_id"})
     df_parquet_agg = aggregate_parquet(df_parquet)
 
     df_merged = pd.merge(df_excel, df_parquet_agg, on="wb_id", how="inner")
     return df_merged
+
 
 def determine_target_type(series, cat_threshold=15):
     """
@@ -182,6 +208,7 @@ def determine_target_type(series, cat_threshold=15):
     else:
         return "categorical"
 
+
 def train_models(X_train, y_train, target_type):
     """
     Train RandomForest with hyperparameter tuning for better performance.
@@ -191,47 +218,45 @@ def train_models(X_train, y_train, target_type):
     encoder_or_bins = None
 
     if target_type == "categorical":
-
         le = LabelEncoder()
         y_encoded = le.fit_transform(y_train.values.ravel())
 
-
         param_grid = {
-            'n_estimators': [300, 500],
-            'max_depth': [None, 20, 50],
-            'min_samples_leaf': [1, 2, 5],
-            'class_weight': ['balanced']
+            "n_estimators": [300, 500],
+            "max_depth": [None, 20, 50],
+            "min_samples_leaf": [1, 2, 5],
+            "class_weight": ["balanced"],
         }
 
         grid = GridSearchCV(
             RandomForestClassifier(random_state=RANDOM_STATE),
             param_grid,
             cv=3,
-            scoring='f1_macro',
-            n_jobs=-1
+            scoring="f1_macro",
+            n_jobs=-1,
         )
         grid.fit(X_train, y_encoded)
 
         clf = grid.best_estimator_
         LOGGER.info("Best RandomForest params: %s", grid.best_params_)
 
-
         reg = RandomForestRegressor(
             n_estimators=500,
-            max_depth=grid.best_params_['max_depth'],
-            min_samples_leaf=grid.best_params_['min_samples_leaf'],
-            random_state=RANDOM_STATE
+            max_depth=grid.best_params_["max_depth"],
+            min_samples_leaf=grid.best_params_["min_samples_leaf"],
+            random_state=RANDOM_STATE,
         )
         reg.fit(X_train, y_encoded)
 
         encoder_or_bins = le
 
     else:
-
         n_bins = min(10, y_train.nunique())
         if n_bins >= 2:
             y_array = y_train.values.ravel()
-            y_binned, bins = pd.qcut(y_array, q=n_bins, labels=False, retbins=True, duplicates='drop')
+            y_binned, bins = pd.qcut(
+                y_array, q=n_bins, labels=False, retbins=True, duplicates="drop"
+            )
             clf = RandomForestClassifier(n_estimators=500, random_state=RANDOM_STATE)
             clf.fit(X_train, y_binned)
             encoder_or_bins = bins
@@ -239,6 +264,7 @@ def train_models(X_train, y_train, target_type):
         reg.fit(X_train, y_train.values.ravel())
 
     return clf, reg, encoder_or_bins
+
 
 def get_top_features(importances, feature_names, top_n=15):
     """
@@ -248,15 +274,18 @@ def get_top_features(importances, feature_names, top_n=15):
     top_features = [f for f, imp in feat_imp[:top_n]]
     return top_features, feat_imp[:top_n]
 
+
 def plot_feature_importance(importances, feature_names, output_path, target_name=None):
     """
     Plot and save a bar chart of feature importances (top 15).
     """
-    feats, imps = zip(*sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True))
+    feats, imps = zip(
+        *sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)
+    )
     top_feats = list(feats[:15])
     top_imps = list(imps[:15])
     plt.figure(figsize=(10, 6))
-    ax = sns.barplot(x=top_imps, y=top_feats, palette='coolwarm')
+    ax = sns.barplot(x=top_imps, y=top_feats, palette="coolwarm")
     title = "Top 15 Feature Importances"
     if target_name:
         title += f" for predicting {target_name}"
@@ -266,11 +295,14 @@ def plot_feature_importance(importances, feature_names, output_path, target_name
 
     for p in ax.patches:
         width = p.get_width()
-        ax.text(width + 0.001, p.get_y() + p.get_height()/2, f"{width:.2f}", va='center')
+        ax.text(
+            width + 0.001, p.get_y() + p.get_height() / 2, f"{width:.2f}", va="center"
+        )
     plt.tight_layout()
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path)
     plt.close()
+
 
 def plot_feature_distributions(df, features, target_name, target_type, output_dir):
     """
@@ -282,47 +314,55 @@ def plot_feature_distributions(df, features, target_name, target_type, output_di
     df_plot = df.copy()
     df_plot = df_plot.loc[:, ~df_plot.columns.duplicated()]
     if target_type == "continuous":
-
         n_unique = df_plot[target_name].nunique()
         n_bins = min(5, n_unique)
         try:
-            df_plot['target_group'] = pd.qcut(df_plot[target_name], q=n_bins, labels=False, duplicates='drop')
+            df_plot["target_group"] = pd.qcut(
+                df_plot[target_name], q=n_bins, labels=False, duplicates="drop"
+            )
         except Exception:
-            df_plot['target_group'] = pd.cut(df_plot[target_name], bins=n_bins, labels=False)
-        hue_col = 'target_group'
+            df_plot["target_group"] = pd.cut(
+                df_plot[target_name], bins=n_bins, labels=False
+            )
+        hue_col = "target_group"
     else:
         hue_col = target_name
 
     for feat in features:
         plt.figure(figsize=(8, 6))
         if pd.api.types.is_numeric_dtype(df_plot[feat]):
-
             sns.boxplot(x=hue_col, y=feat, data=df_plot)
-            title = f"Boxplot of {feat} by {'Target' if target_type=='continuous' else target_name}"
+            title = f"Boxplot of {feat} by {'Target' if target_type == 'continuous' else target_name}"
             plt.title(title)
-            plt.xlabel('Target Bin' if target_type=='continuous' else target_name)
+            plt.xlabel("Target Bin" if target_type == "continuous" else target_name)
             plt.ylabel(feat)
         else:
-
             sns.countplot(x=feat, hue=hue_col, data=df_plot)
-            title = f"Countplot of {feat} by {'Target' if target_type=='continuous' else target_name}"
+            title = f"Countplot of {feat} by {'Target' if target_type == 'continuous' else target_name}"
             plt.title(title)
             plt.xlabel(feat)
             plt.ylabel("Count")
-        plt.xticks(rotation=45, ha='right')
+        plt.xticks(rotation=45, ha="right")
         plt.tight_layout()
         safe_feat = feat.replace(" ", "_")
-        plot_type = "boxplot" if pd.api.types.is_numeric_dtype(df_plot[feat]) else "countplot"
+        plot_type = (
+            "boxplot" if pd.api.types.is_numeric_dtype(df_plot[feat]) else "countplot"
+        )
         out_file = os.path.join(output_dir, f"{safe_feat}_{plot_type}.png")
         plt.savefig(out_file)
 
+
 def save_predictions_csv(filename, wb_ids, y_true, clf_pred, reg_pred, combined_pred):
     """Write predictions with a stable join key for the map."""
-    import numpy as np
-    import pandas as pd
 
     # Coerce to 1-D arrays and drop any pre-existing indices
-    wb_ids_arr = pd.Series(wb_ids, dtype="string").reset_index(drop=True).astype(str).str.strip().str.upper()
+    wb_ids_arr = (
+        pd.Series(wb_ids, dtype="string")
+        .reset_index(drop=True)
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
     y_true_arr = pd.Series(y_true).reset_index(drop=True).astype(object).values.ravel()
     clf_arr = pd.Series(clf_pred).reset_index(drop=True).values.ravel()
     reg_arr = pd.Series(reg_pred).reset_index(drop=True).values.ravel()
@@ -331,29 +371,39 @@ def save_predictions_csv(filename, wb_ids, y_true, clf_pred, reg_pred, combined_
     # Ensure equal lengths (fail early with a clear message)
     lens = [len(wb_ids_arr), len(y_true_arr), len(clf_arr), len(reg_arr), len(comb_arr)]
     if len(set(lens)) != 1:
-        raise ValueError(f"save_predictions_csv: length mismatch {lens} "
-                         "(check y_test vs X_test-derived predictions)")
+        raise ValueError(
+            f"save_predictions_csv: length mismatch {lens} "
+            "(check y_test vs X_test-derived predictions)"
+        )
 
     n = lens[0]
-    df_out = pd.DataFrame({
-        "wb_id": wb_ids_arr,
-        "True_Target": y_true_arr,
-        "Pred_Classifier": clf_arr,
-        "Pred_Regressor": reg_arr,
-        "Pred_Combined": comb_arr,
-    }, index=pd.RangeIndex(n))
+    df_out = pd.DataFrame(
+        {
+            "wb_id": wb_ids_arr,
+            "True_Target": y_true_arr,
+            "Pred_Classifier": clf_arr,
+            "Pred_Regressor": reg_arr,
+            "Pred_Combined": comb_arr,
+        },
+        index=pd.RangeIndex(n),
+    )
 
     df_out.to_csv(filename, index=False)
 
 
-def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plots/feature_score_scatter.png"):
+def evaluate_and_plot_feature_performance(
+    X, y, feature_names, output_path="plots/feature_score_scatter.png"
+):
     os.makedirs("plots", exist_ok=True)
-    
 
     if isinstance(X, np.ndarray):
-        X = pd.DataFrame(X, columns=feature_names if feature_names is not None else [f"feature_{i}" for i in range(X.shape[1])])
-    
-    
+        X = pd.DataFrame(
+            X,
+            columns=feature_names
+            if feature_names is not None
+            else [f"feature_{i}" for i in range(X.shape[1])],
+        )
+
     results = []
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
@@ -361,7 +411,6 @@ def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plot
         return series.astype(str).str.strip().str.lower()
 
     y_norm = normalize_labels(y)
-
 
     for feat in feature_names:
         acc_scores, f1_scores = [], []
@@ -374,18 +423,22 @@ def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plot
             y_pred = model.predict(X_test)
 
             acc_scores.append(accuracy_score(y_test, y_pred))
-            f1_scores.append(f1_score(y_test, y_pred, average='macro'))
+            f1_scores.append(f1_score(y_test, y_pred, average="macro"))
 
-        results.append({
-            "Feature": feat,
-            "Accuracy": np.mean(acc_scores),
-            "F1 Score": np.mean(f1_scores)
-        })
-
+        results.append(
+            {
+                "Feature": feat,
+                "Accuracy": np.mean(acc_scores),
+                "F1 Score": np.mean(f1_scores),
+            }
+        )
 
     acc_scores, f1_scores = [], []
     for train_idx, test_idx in skf.split(X[feature_names], y_norm):
-        X_train, X_test = X.iloc[train_idx][feature_names], X.iloc[test_idx][feature_names]
+        X_train, X_test = (
+            X.iloc[train_idx][feature_names],
+            X.iloc[test_idx][feature_names],
+        )
         y_train, y_test = y_norm.iloc[train_idx], y_norm.iloc[test_idx]
 
         model = RandomForestClassifier(n_estimators=100, random_state=42)
@@ -393,47 +446,61 @@ def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plot
         y_pred = model.predict(X_test)
 
         acc_scores.append(accuracy_score(y_test, y_pred))
-        f1_scores.append(f1_score(y_test, y_pred, average='macro'))
+        f1_scores.append(f1_score(y_test, y_pred, average="macro"))
 
-    results.append({
-        "Feature": "All Features",
-        "Accuracy": np.mean(acc_scores),
-        "F1 Score": np.mean(f1_scores)
-    })
-
+    results.append(
+        {
+            "Feature": "All Features",
+            "Accuracy": np.mean(acc_scores),
+            "F1 Score": np.mean(f1_scores),
+        }
+    )
 
     baseline_label = "2"
     y_baseline = pd.Series([baseline_label] * len(y_norm))
-    
+
     LOGGER.info("Unique normalized labels: %s", y_norm.unique())
     LOGGER.info("Baseline first 5 predictions: %s", y_baseline.head())
-    
+
     baseline_acc = accuracy_score(y_norm, y_baseline)
-    baseline_f1 = f1_score(y_norm, y_baseline, average='macro')
+    baseline_f1 = f1_score(y_norm, y_baseline, average="macro")
 
     LOGGER.info("Unique labels in dataset: %s", y_norm.unique())
 
-    results.append({
-        "Feature": "Predict Moderate",
-        "Accuracy": baseline_acc,
-        "F1 Score": baseline_f1
-    })
-
+    results.append(
+        {
+            "Feature": "Predict Moderate",
+            "Accuracy": baseline_acc,
+            "F1 Score": baseline_f1,
+        }
+    )
 
     df_results = pd.DataFrame(results)
     plt.figure(figsize=(10, 6))
 
-    plt.scatter(df_results["Accuracy"], df_results["F1 Score"],
-                c='skyblue', edgecolors='black', label='Features')
+    plt.scatter(
+        df_results["Accuracy"],
+        df_results["F1 Score"],
+        c="skyblue",
+        edgecolors="black",
+        label="Features",
+    )
 
     baseline_row = df_results[df_results["Feature"] == "Predict Moderate"].iloc[0]
-    plt.scatter(baseline_row["Accuracy"], baseline_row["F1 Score"],
-                color='red', s=80, label='Predict Moderate')
+    plt.scatter(
+        baseline_row["Accuracy"],
+        baseline_row["F1 Score"],
+        color="red",
+        s=80,
+        label="Predict Moderate",
+    )
 
     for i, row in df_results.iterrows():
-        plt.annotate(row["Feature"],
-                     (row["Accuracy"] + 0.001, row["F1 Score"] + 0.001),
-                     fontsize=8)
+        plt.annotate(
+            row["Feature"],
+            (row["Accuracy"] + 0.001, row["F1 Score"] + 0.001),
+            fontsize=8,
+        )
 
     plt.xlabel("Accuracy")
     plt.ylabel("F1 Score")
@@ -445,8 +512,8 @@ def evaluate_and_plot_feature_performance(X, y, feature_names, output_path="plot
     plt.show()
     LOGGER.info(f"Scatter plot saved as '{output_path}'")
 
-def main(args):
 
+def main(args):
     df_excel = load_excel_data(args.excel_path)
 
     df_excel = df_excel.drop(columns=["Overall Water Body Class"], errors="ignore")
@@ -454,14 +521,12 @@ def main(args):
     df_parquet = load_parquet_data(args.parquet_path)
     LOGGER.info(f"Parquet data: {df_parquet.shape} (rows, columns)")
 
-
     df_merged = merge_datasets(df_excel, df_parquet)
     LOGGER.info(f"Merged data before filtering: {df_merged.shape} (rows, columns)")
 
-
     target_col = args.target
-    df_excel = df_excel.rename(columns={'Water Body ID': 'wb_id'})
-    target_df = df_excel[['wb_id', target_col]]
+    df_excel = df_excel.rename(columns={"Water Body ID": "wb_id"})
+    target_df = df_excel[["wb_id", target_col]]
 
     """
     chemical_keywords = ['NO3', 'NH4', 'PO4', 'Nitrate', 'Phosphate', 'Ammonia', 'Nitrogen', 'Phosphorus', 'mg', 'ug', 'conc', 'chem']
@@ -470,47 +535,38 @@ def main(args):
     # Merge target and features
     df_merged = pd.merge(target_df, wims_df, on='wb_id', how='inner')
     """
-    var_counts = df_parquet['variable'].value_counts()
+    var_counts = df_parquet["variable"].value_counts()
     frequent_vars = var_counts[var_counts > 1e6].index.tolist()
 
     LOGGER.info(f"Found {len(frequent_vars)} frequent variables with > 1M records")
     LOGGER.info("Sample: %s", frequent_vars[:5])
-    
 
-    df_filtered = df_parquet[df_parquet['variable'].isin(frequent_vars)]
-
+    df_filtered = df_parquet[df_parquet["variable"].isin(frequent_vars)]
 
     pivot_df = df_filtered.pivot_table(
-        index='wb_id',
-        columns='variable',
-        values='result',
-        aggfunc='mean'
-        ).reset_index()
+        index="wb_id", columns="variable", values="result", aggfunc="mean"
+    ).reset_index()
 
-
-    df_excel = df_excel.rename(columns={'Water Body ID': 'wb_id'})
-    target_df = df_excel[['wb_id', target_col]]
-    df_merged = pd.merge(target_df, pivot_df, on='wb_id', how='inner')
-
+    df_excel = df_excel.rename(columns={"Water Body ID": "wb_id"})
+    target_df = df_excel[["wb_id", target_col]]
+    df_merged = pd.merge(target_df, pivot_df, on="wb_id", how="inner")
 
     df_merged = df_merged.dropna()
-    
+
     target = args.target
     if isinstance(target, list):
         target = target[0]
     if target not in df_merged.columns:
         raise ValueError(f"Target '{target}' not in merged data.")
 
-
     df_model = df_merged.dropna(subset=[target]).reset_index(drop=True)
     df_model = df_model.loc[:, ~df_model.columns.duplicated()]
-    wb_ids_all = df_model['wb_id'].astype(str).str.strip().str.upper().copy()
+    wb_ids_all = df_model["wb_id"].astype(str).str.strip().str.upper().copy()
 
-    if 'wb_id' in df_model.columns:
-        df_model = df_model.drop(columns=['wb_id'])
+    if "wb_id" in df_model.columns:
+        df_model = df_model.drop(columns=["wb_id"])
     X = df_model.drop(columns=[target]).copy()
     y = df_model[target].copy()
-
 
     mask = y.astype(str).str.lower().str.strip() != "not assessed"
     X = X[mask].reset_index(drop=True)
@@ -522,28 +578,34 @@ def main(args):
     LOGGER.info("Index match: %s", X.index.equals(y.index))
     LOGGER.info(f"Target '{target}' type: %s", type(y.iloc[0]))
 
-
     target_type = determine_target_type(y)
     LOGGER.info(f"Target '{target}' is detected as {target_type}.")
 
     X_train, X_test, y_train, y_test, wb_train, wb_test = train_test_split(
-    X, y, wb_ids, test_size=0.2, random_state=RANDOM_STATE
+        X, y, wb_ids, test_size=0.2, random_state=RANDOM_STATE
     )
 
-    cat_cols = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
+    cat_cols = X_train.select_dtypes(include=["object", "category"]).columns.tolist()
     small_cat_cols = []
     high_cat_cols = []
     if cat_cols:
-
         for col in cat_cols:
             X_train[col] = X_train[col].astype(str)
             X_test[col] = X_test[col].astype(str)
 
-        small_cat_cols = [col for col in cat_cols if X_train[col].nunique() <= MAX_CATEGORIES_FOR_ONEHOT]
-        high_cat_cols = [col for col in cat_cols if X_train[col].nunique() > MAX_CATEGORIES_FOR_ONEHOT]
+        small_cat_cols = [
+            col
+            for col in cat_cols
+            if X_train[col].nunique() <= MAX_CATEGORIES_FOR_ONEHOT
+        ]
+        high_cat_cols = [
+            col
+            for col in cat_cols
+            if X_train[col].nunique() > MAX_CATEGORIES_FOR_ONEHOT
+        ]
 
         if small_cat_cols:
-            ohe = OneHotEncoder(sparse=True, handle_unknown='ignore')
+            ohe = OneHotEncoder(sparse=True, handle_unknown="ignore")
             X_train_onehot = ohe.fit_transform(X_train[small_cat_cols])
             X_test_onehot = ohe.transform(X_test[small_cat_cols])
             onehot_feature_names = ohe.get_feature_names_out(small_cat_cols)
@@ -553,7 +615,9 @@ def main(args):
             onehot_feature_names = []
 
         if high_cat_cols:
-            ord_enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+            ord_enc = OrdinalEncoder(
+                handle_unknown="use_encoded_value", unknown_value=-1
+            )
             X_train_ord = ord_enc.fit_transform(X_train[high_cat_cols])
             X_test_ord = ord_enc.transform(X_test[high_cat_cols])
         else:
@@ -578,19 +642,15 @@ def main(args):
 
         feature_names_enc = numeric_cols + high_cat_cols + list(onehot_feature_names)
     else:
-
         X_train_enc = X_train.values
         X_test_enc = X_test.values
         feature_names_enc = list(X_train.columns)
         ord_enc = None
 
-
     X_train = X_train_enc
     X_test = X_test_enc
 
-
     clf, reg, encoder_or_bins = train_models(X_train, y_train, target_type)
-
 
     if target_type == "categorical" and clf is not None:
         importances = clf.feature_importances_
@@ -600,7 +660,6 @@ def main(args):
         feature_names = feature_names_enc
     else:
         raise ValueError("No valid model to determine feature importances.")
-
 
     top_feats, top_importances = get_top_features(importances, feature_names, top_n=15)
     LOGGER.info("Top 15 features:")
@@ -613,67 +672,73 @@ def main(args):
     for feat, imp in top_importances:
         LOGGER.info(f"  {feat}: {imp:.4f}")
 
-
     if high_cat_cols:
         for col in high_cat_cols:
             X[col] = X[col].astype(str)
         try:
             X[high_cat_cols] = ord_enc.transform(X[high_cat_cols])
         except Exception as e:
-            LOGGER.info(f"Warning: could not ordinal-encode all high-cardinality features: {e}")
+            LOGGER.info(
+                f"Warning: could not ordinal-encode all high-cardinality features: {e}"
+            )
 
     for feat in top_feats:
         if feat not in X.columns:
             for col in cat_cols:
                 if feat.startswith(str(col) + "_"):
-                    cat_val = feat[len(col)+1:]
+                    cat_val = feat[len(col) + 1 :]
 
                     X[feat] = (X[col].astype(str) == cat_val).astype(int)
                     break
 
-  
     os.makedirs("plots", exist_ok=True)
     corr_df = X[top_feats].dropna()
     corr_matrix = corr_df.corr()
     plt.figure(figsize=(10, 8))
-    sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap='coolwarm', vmin=-1, vmax=1)
+    sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="coolwarm", vmin=-1, vmax=1)
     plt.title("Pearson Correlation Matrix of Top 15 Features")
     plt.tight_layout()
     plt.savefig("plots/correlation_matrix.png")
     plt.show()
 
-
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     clf_cv = RandomForestClassifier(random_state=RANDOM_STATE)
-    scores = cross_val_score(clf_cv, X[top_feats], y.values.ravel(), cv=skf, scoring='accuracy')
+    scores = cross_val_score(
+        clf_cv, X[top_feats], y.values.ravel(), cv=skf, scoring="accuracy"
+    )
     plt.figure(figsize=(6, 6))
-    sns.boxplot(y=scores, color='lightgreen')
+    sns.boxplot(y=scores, color="lightgreen")
     plt.title("5-fold Cross-validation Accuracy")
     plt.ylabel("Accuracy")
     plt.tight_layout()
     plt.savefig("plots/cv_accuracy_boxplot.png")
     plt.show()
 
-
-    plot_feature_importance(importances, feature_names, "plots/feature_importance.png", target)
+    plot_feature_importance(
+        importances, feature_names, "plots/feature_importance.png", target
+    )
     LOGGER.info("Feature importance plot saved as 'plots/feature_importance.png'.")
-
 
     feat_index_map = {name: idx for idx, name in enumerate(feature_names_enc)}
     top_indices = [feat_index_map[f] for f in top_feats if f in feat_index_map]
-    if isinstance(X_train, np.ndarray) or hasattr(X_train, 'toarray'):
-
+    if isinstance(X_train, np.ndarray) or hasattr(X_train, "toarray"):
         X_train_sel_enc = X_train[:, top_indices]
         X_test_sel_enc = X_test[:, top_indices]
-        X_train_sel = pd.DataFrame(X_train_sel_enc.toarray() if hasattr(X_train_sel_enc, 'toarray') else X_train_sel_enc,
-                                   columns=top_feats)
-        X_test_sel = pd.DataFrame(X_test_sel_enc.toarray() if hasattr(X_test_sel_enc, 'toarray') else X_test_sel_enc,
-                                  columns=top_feats)
+        X_train_sel = pd.DataFrame(
+            X_train_sel_enc.toarray()
+            if hasattr(X_train_sel_enc, "toarray")
+            else X_train_sel_enc,
+            columns=top_feats,
+        )
+        X_test_sel = pd.DataFrame(
+            X_test_sel_enc.toarray()
+            if hasattr(X_test_sel_enc, "toarray")
+            else X_test_sel_enc,
+            columns=top_feats,
+        )
     else:
-
         X_train_sel = X_train[top_feats].copy()
         X_test_sel = X_test[top_feats].copy()
-
 
     from sklearn.feature_selection import VarianceThreshold
 
@@ -681,77 +746,78 @@ def main(args):
     X_train_sel = vt.fit_transform(X_train_sel)
     X_test_sel = vt.transform(X_test_sel)
 
-
     clf2, reg2, encoder_or_bins2 = train_models(X_train_sel, y_train, target_type)
-
 
     from lightgbm import LGBMClassifier
     from sklearn.metrics import accuracy_score, f1_score
 
-    lgbm_pred = None 
+    lgbm_pred = None
 
     if target_type == "categorical":
         lgbm = LGBMClassifier(
-            n_estimators=300,      
+            n_estimators=300,
             learning_rate=0.05,
             num_leaves=31,
-            class_weight='balanced',
-            random_state=RANDOM_STATE
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
         )
         from lightgbm import early_stopping, log_evaluation
 
         lgbm.fit(
-            X_train_sel, y_train,
+            X_train_sel,
+            y_train,
             eval_set=[(X_test_sel, y_test)],
-            eval_metric='multi_logloss',
-            callbacks=[early_stopping(50), log_evaluation(20)]
+            eval_metric="multi_logloss",
+            callbacks=[early_stopping(50), log_evaluation(20)],
         )
         lgbm_pred = lgbm.predict(X_test_sel)
 
         acc = accuracy_score(y_test, lgbm_pred)
-        f1 = f1_score(y_test, lgbm_pred, average='macro')
+        f1 = f1_score(y_test, lgbm_pred, average="macro")
 
         LOGGER.info(f"LightGBM Test Accuracy: {acc:.4f}")
         LOGGER.info(f"LightGBM Macro F1: {f1:.4f}")
 
-        
     if target_type == "categorical":
-
         clf_pred_enc = clf2.predict(X_test_sel)
         reg_pred = reg2.predict(X_test_sel)
-        
+
         ensemble_pred = None
         if target_type == "categorical" and lgbm_pred is not None:
-            rf_pred = clf2.predict(X_test_sel) 
+            rf_pred = clf2.predict(X_test_sel)
             ensemble_pred = np.where(rf_pred == lgbm_pred, rf_pred, lgbm_pred)
 
             acc_ens = accuracy_score(y_test, ensemble_pred)
-            f1_ens = f1_score(y_test, ensemble_pred, average='macro')
+            f1_ens = f1_score(y_test, ensemble_pred, average="macro")
 
             LOGGER.info(f"Ensemble Accuracy: {acc_ens:.4f}")
             LOGGER.info(f"Ensemble Macro F1: {f1_ens:.4f}")
-        
-        
-        
+
         avg_pred = 0.5 * (clf_pred_enc + reg_pred)
         combined_num = np.rint(avg_pred).astype(int)
-        
+
         le = encoder_or_bins
         combined_num = np.clip(combined_num, 0, len(le.classes_) - 1)
         final_pred = le.inverse_transform(combined_num)
         clf_pred = le.inverse_transform(clf_pred_enc)
 
     else:
-
         reg_pred = reg2.predict(X_test_sel)
         if clf2 is not None:
-           
             clf_pred_bins = clf2.predict(X_test_sel)
-            df_temp = pd.DataFrame({'target': y_train.values.ravel()})
+            df_temp = pd.DataFrame({"target": y_train.values.ravel()})
             n_bins = len(np.unique(clf_pred_bins))
-            df_temp['bin'], bins = pd.qcut(df_temp['target'], q=n_bins, labels=False, retbins=True, duplicates='drop')
-            bin_medians = df_temp.groupby('bin')['target'].median().to_dict()
-            class_pred_numeric = np.array([bin_medians.get(b, np.nan) for b in clf_pred_bins])
+            df_temp["bin"], bins = pd.qcut(
+                df_temp["target"],
+                q=n_bins,
+                labels=False,
+                retbins=True,
+                duplicates="drop",
+            )
+            bin_medians = df_temp.groupby("bin")["target"].median().to_dict()
+            class_pred_numeric = np.array(
+                [bin_medians.get(b, np.nan) for b in clf_pred_bins]
+            )
             final_pred = 0.5 * (class_pred_numeric + reg_pred)
             clf_pred = clf_pred_bins
 
@@ -772,14 +838,13 @@ def main(args):
     )
     """
     save_predictions_csv(
-    "model_predictions.csv",
-    wb_test,  # <- stable join key
-    y_test,
-    clf_pred,
-    reg_pred,
-    ensemble_pred if ensemble_pred is not None else final_pred
+        "model_predictions.csv",
+        wb_test,  # <- stable join key
+        y_test,
+        clf_pred,
+        reg_pred,
+        ensemble_pred if ensemble_pred is not None else final_pred,
     )
-
 
     df_plot = X[top_feats].copy()
     df_plot[target] = y.values
@@ -789,26 +854,18 @@ def main(args):
 
         for feat in top_feats:
             if feat not in df_model.columns:
-                df_plot[feat] = df_plot[feat].astype('category')
-    plot_feature_distributions(df_plot, top_feats, target, target_type, output_dir="feature_plots")
+                df_plot[feat] = df_plot[feat].astype("category")
+    plot_feature_distributions(
+        df_plot, top_feats, target, target_type, output_dir="feature_plots"
+    )
     LOGGER.info("Feature distribution plots saved to 'feature_plots/' directory.")
-
 
     evaluate_and_plot_feature_performance(X_test_sel, pd.Series(y_test_enc), top_feats)
     model_used = clf2 if target_type == "categorical" else reg2
     return final_pred, model_used, X_train_sel, top_feats
 
-from sklearn.base import is_classifier
-from sklearn.inspection import PartialDependenceDisplay, partial_dependence
-
 
 def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import pandas as pd
-    from sklearn.base import is_classifier
-    from sklearn.inspection import PartialDependenceDisplay, partial_dependence
-
     # --- make X a DataFrame so .sample works and names align ---
     if isinstance(X, np.ndarray):
         if feature_names is None or len(feature_names) != X.shape[1]:
@@ -818,25 +875,6 @@ def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
         X_df = X.copy()
         if feature_names is None:
             feature_names = list(X_df.columns)
-
-
-    if hasattr(model, "feature_importances_"):
-        importances = model.feature_importances_
-        top_idx = np.argsort(importances)[::-1][:min(top_n, X_df.shape[1])]
-    else:
-        top_idx = np.arange(min(top_n, X_df.shape[1]))
-    top_features = [feature_names[i] for i in top_idx]
-
-
-    for idx, fname in zip(top_idx, top_features):
-        try:
-            pdp_res = partial_dependence(
-                model, X_df.values, [idx], feature_names=feature_names, kind='both'
-            )
-        except TypeError:
-            pdp_res = partial_dependence(
-                model, X_df.values, [idx], feature_names=feature_names
-            )
 
     if PDP_2D_PAIRS:
         for f1, f2 in PDP_2D_PAIRS:
@@ -852,17 +890,18 @@ def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
                     TARGET_CLASS_NAME = "Moderate"
                     class_index = (
                         list(model.classes_).index(TARGET_CLASS_NAME)
-                        if hasattr(model, "classes_") and TARGET_CLASS_NAME in model.classes_
+                        if hasattr(model, "classes_")
+                        and TARGET_CLASS_NAME in model.classes_
                         else None
                     )
 
                     _ = PartialDependenceDisplay.from_estimator(
                         model,
-                        X_pdp.values,                 
+                        X_pdp.values,
                         [(idx1, idx2)],
                         feature_names=feature_names,
                         grid_resolution=25,
-                        **({"target": class_index} if class_index is not None else {})
+                        **({"target": class_index} if class_index is not None else {}),
                     )
                     plt.tight_layout()
                     out_file = f"plots/pdp_2d_{f1}_{f2}.png"
@@ -871,23 +910,22 @@ def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
                     LOGGER.info(f"2D PDP saved as {out_file}")
 
                 except Exception as e:
-
                     LOGGER.info(f" Skipped 2D PDP for {f1} & {f2}: {e}")
                     try:
                         pdp_res_2d = partial_dependence(
                             model,
-                            X_pdp.values,               
+                            X_pdp.values,
                             [(idx1, idx2)],
                             feature_names=feature_names,
-                            grid_resolution=25
+                            grid_resolution=25,
                         )
-                        grid1 = pdp_res_2d['grid_values'][0]
-                        grid2 = pdp_res_2d['grid_values'][1]
-                        avg_preds_2d = pdp_res_2d['average'][0]
+                        grid1 = pdp_res_2d["grid_values"][0]
+                        grid2 = pdp_res_2d["grid_values"][1]
+                        avg_preds_2d = pdp_res_2d["average"][0]
                         Xx, Yy = np.meshgrid(grid2, grid1)
                         plt.figure(figsize=(6, 5))
-                        plt.contourf(Xx, Yy, avg_preds_2d, cmap='viridis')
-                        plt.colorbar(label='Predicted')
+                        plt.contourf(Xx, Yy, avg_preds_2d, cmap="viridis")
+                        plt.colorbar(label="Predicted")
                         plt.xlabel(f2)
                         plt.ylabel(f1)
                         plt.title(f"2D PDP of {f1} and {f2}")
@@ -897,9 +935,6 @@ def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
                         LOGGER.info(f"2D PDP saved (fallback) as {out_file}")
                     except Exception as ee:
                         LOGGER.info(f"Failed 2D PDP fallback for {f1} & {f2}: {ee}")
-
-
-
 
 
 def save_1d_pdp_plots(
@@ -937,13 +972,6 @@ def save_1d_pdp_plots(
         For classifiers, if non-empty, only these class labels (names or indices)
         are plotted; otherwise all classes are plotted.
     """
-    import os
-
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import pandas as pd
-    from sklearn.inspection import PartialDependenceDisplay
-
 
     X = np.asarray(X)
     n_rows, n_cols = X.shape
@@ -955,12 +983,10 @@ def save_1d_pdp_plots(
 
     X_df = pd.DataFrame(X, columns=feature_names)
 
-
     if row_subsample is not None and row_subsample < n_rows:
         rs = np.random.RandomState(42)
         idx = rs.choice(n_rows, size=row_subsample, replace=False)
         X_df = X_df.iloc[idx].reset_index(drop=True)
-
 
     if hasattr(model, "feature_importances_"):
         importances = np.asarray(model.feature_importances_)
@@ -976,9 +1002,7 @@ def save_1d_pdp_plots(
 
     os.makedirs(out_dir, exist_ok=True)
 
-
     is_classifier = hasattr(model, "predict_proba") or hasattr(model, "classes_")
-
 
     class_targets = None
     class_labels = None
@@ -1007,51 +1031,61 @@ def save_1d_pdp_plots(
         fname = feature_names[idx]
 
         if is_classifier and class_targets is not None and len(class_targets) > 0:
-
             for targ in class_targets:
                 fig, ax = _fresh_ax()
                 try:
-
                     PartialDependenceDisplay.from_estimator(
-                        model, X_df, features=[idx],
+                        model,
+                        X_df,
+                        features=[idx],
                         grid_resolution=grid_resolution,
                         kind="average",
-                        target=targ, ax=ax,
+                        target=targ,
+                        ax=ax,
                     )
                 except TypeError:
-
                     try:
                         PartialDependenceDisplay.from_estimator(
-                            model, X_df, features=[idx],
-                            grid_resolution=grid_resolution, ax=ax,
+                            model,
+                            X_df,
+                            features=[idx],
+                            grid_resolution=grid_resolution,
+                            ax=ax,
                         )
                     except Exception:
                         plt.close(fig)
                         continue
 
-                ax.set_title(f"PDP: {fname} (class {class_labels[targ] if class_labels else targ})")
+                ax.set_title(
+                    f"PDP: {fname} (class {class_labels[targ] if class_labels else targ})"
+                )
                 ax.set_xlabel(fname)
                 out_path = os.path.join(
                     out_dir,
-                    f"pdp_1d_{fname}__class_{class_labels[targ] if class_labels else targ}.png"
+                    f"pdp_1d_{fname}__class_{class_labels[targ] if class_labels else targ}.png",
                 )
                 fig.savefig(out_path, dpi=120)
                 plt.close(fig)
                 saved_files.append(out_path)
         else:
-
             fig, ax = _fresh_ax()
             try:
                 PartialDependenceDisplay.from_estimator(
-                    model, X_df, features=[idx],
+                    model,
+                    X_df,
+                    features=[idx],
                     grid_resolution=grid_resolution,
-                    kind="average", ax=ax,
+                    kind="average",
+                    ax=ax,
                 )
             except TypeError:
                 try:
                     PartialDependenceDisplay.from_estimator(
-                        model, X_df, features=[idx],
-                        grid_resolution=grid_resolution, ax=ax,
+                        model,
+                        X_df,
+                        features=[idx],
+                        grid_resolution=grid_resolution,
+                        ax=ax,
                     )
                 except Exception:
                     plt.close(fig)
@@ -1067,29 +1101,37 @@ def save_1d_pdp_plots(
     return saved_files
 
 
-
-
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Data processing and modeling")
-    parser.add_argument("--excel_path", type=str, default="WFD_SW_Classification_Status_and_Objectives_Cycle2_v4.xlsx")
+    parser.add_argument(
+        "--excel_path",
+        type=str,
+        default="WFD_SW_Classification_Status_and_Objectives_Cycle2_v4.xlsx",
+    )
     parser.add_argument("--parquet_path", type=str, default="wims_wfd_merged.parquet")
     parser.add_argument("--target", type=str, default="Ecological Class")
     args = parser.parse_args()
     final_pred, model, X_train_used, feature_names_used = main(args)
-    
-
 
     os.makedirs("model_predictions", exist_ok=True)
     out_path = os.path.join("model_predictions", "final_predictions.csv")
 
-    explain_model(model, X_train_used, feature_names=feature_names_used, target_name=args.target, top_n=15)
+    explain_model(
+        model,
+        X_train_used,
+        feature_names=feature_names_used,
+        target_name=args.target,
+        top_n=15,
+    )
 
     save_1d_pdp_plots(
-    model, X_train_used, feature_names_used,
-    out_dir="plots", top_n=15, row_subsample=5000
-)
+        model,
+        X_train_used,
+        feature_names_used,
+        out_dir="plots",
+        top_n=15,
+        row_subsample=5000,
+    )
 # accuracy and f1 for just predicting "moderate"
 # try quantiles
 # softwhere testing
