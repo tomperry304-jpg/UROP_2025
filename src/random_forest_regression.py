@@ -9,7 +9,10 @@ import argparse
 import logging
 import os
 import random
+import sys
+from concurrent.futures import ProcessPoolExecutor as PoolExecutor
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -28,9 +31,12 @@ from sklearn.preprocessing import LabelEncoder, OneHotEncoder, OrdinalEncoder
 
 from process_input import process_and_aggregate
 
+if sys.platform == "linux":
+    matplotlib.use("Agg")  # Use non-GUI backend on Linux servers
+
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(
-    format="%(asctime)s %(levelname)-8s %(message)s",
+    format="%(asctime)s %(process)d %(levelname)-8s %(message)s",
     level=logging.INFO,
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -105,6 +111,7 @@ def train_models(X_train, y_train, target_type):
             max_depth=grid.best_params_["max_depth"],
             min_samples_leaf=grid.best_params_["min_samples_leaf"],
             random_state=RANDOM_STATE,
+            n_jobs=-1,  # Use all available cores
         )
         reg.fit(X_train, y_encoded)
 
@@ -139,6 +146,7 @@ def plot_feature_importance(importances, feature_names, output_path, target_name
     """
     Plot and save a bar chart of feature importances (top 15).
     """
+
     feats, imps = zip(
         *sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)
     )
@@ -273,12 +281,13 @@ def evaluate_and_plot_feature_performance(
     y_norm = normalize_labels(y)
 
     for feat in feature_names:
+        LOGGER.info("Evaluating feature: %s", feat)
         acc_scores, f1_scores = [], []
         for train_idx, test_idx in skf.split(X[[feat]], y_norm):
             X_train, X_test = X.iloc[train_idx][[feat]], X.iloc[test_idx][[feat]]
             y_train, y_test = y_norm.iloc[train_idx], y_norm.iloc[test_idx]
 
-            model = RandomForestClassifier(n_estimators=100, random_state=42)
+            model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
             model.fit(X_train, y_train)
             y_pred = model.predict(X_test)
 
@@ -373,24 +382,28 @@ def evaluate_and_plot_feature_performance(
     LOGGER.info(f"Scatter plot saved as '{output_path}'")
 
 
-def random_forest_processing(args):
-    df_merged = process_and_aggregate(args)
+def random_forest_processing(df_classified_chem_data, target_column_name):
+    if isinstance(target_column_name, list):
+        target_column_name = target_column_name[0]
+    if target_column_name not in df_classified_chem_data.columns:
+        raise ValueError(f"Target '{target_column_name}' not in merged data.")
 
-    target = args.target
-    if isinstance(target, list):
-        target = target[0]
-    if target not in df_merged.columns:
-        raise ValueError(f"Target '{target}' not in merged data.")
-
-    df_model = df_merged.dropna(subset=[target]).reset_index(drop=True)
+    # filter out rows with missing target
+    df_model = df_classified_chem_data.dropna(subset=[target_column_name]).reset_index(
+        drop=True
+    )
     df_model = df_model.loc[:, ~df_model.columns.duplicated()]
     wb_ids_all = df_model["wb_id"].astype(str).str.strip().str.upper().copy()
 
     if "wb_id" in df_model.columns:
         df_model = df_model.drop(columns=["wb_id"])
-    X = df_model.drop(columns=[target]).copy()
-    y = df_model[target].copy()
+    X = df_model.drop(columns=[target_column_name]).copy()
+    y = df_model[target_column_name].copy()
 
+    model_columns = set(df_model.columns.tolist())
+    df_model = None
+
+    # Fitler out 'Not Assessed' entries;
     mask = y.astype(str).str.lower().str.strip() != "not assessed"
     X = X[mask].reset_index(drop=True)
     y = y[mask].reset_index(drop=True)
@@ -399,10 +412,10 @@ def random_forest_processing(args):
     LOGGER.info("X shape: %s", X.shape)
     LOGGER.info("y shape: %s", y.shape)
     LOGGER.info("Index match: %s", X.index.equals(y.index))
-    LOGGER.info(f"Target '{target}' type: %s", type(y.iloc[0]))
+    LOGGER.info(f"Target '{target_column_name}' type: %s", type(y.iloc[0]))
 
     target_type = determine_target_type(y)
-    LOGGER.info(f"Target '{target}' is detected as {target_type}.")
+    LOGGER.info(f"Target '{target_column_name}' is detected as {target_type}.")
 
     X_train, X_test, y_train, y_test, wb_train, wb_test = train_test_split(
         X, y, wb_ids, test_size=0.2, random_state=RANDOM_STATE
@@ -473,7 +486,9 @@ def random_forest_processing(args):
     X_train = X_train_enc
     X_test = X_test_enc
 
+    LOGGER.info("Training Main Random Forest model...")
     clf, reg, encoder_or_bins = train_models(X_train, y_train, target_type)
+    LOGGER.info("Training Main Random Forest model complete.")
 
     if target_type == "categorical" and clf is not None:
         importances = clf.feature_importances_
@@ -493,7 +508,7 @@ def random_forest_processing(args):
     else:
         y_test_enc = y_test.values.ravel()
     for feat, imp in top_importances:
-        LOGGER.info(f"  {feat}: {imp:.4f}")
+        LOGGER.info(f'  feature "{feat}": {imp:.4f}')
 
     if high_cat_cols:
         for col in high_cat_cols:
@@ -514,6 +529,7 @@ def random_forest_processing(args):
                     X[feat] = (X[col].astype(str) == cat_val).astype(int)
                     break
 
+    LOGGER.info("Plotting Correlation Matrix...")
     os.makedirs("plots", exist_ok=True)
     corr_df = X[top_feats].dropna()
     corr_matrix = corr_df.corr()
@@ -524,11 +540,13 @@ def random_forest_processing(args):
     plt.savefig("plots/correlation_matrix.png")
     plt.show()
 
+    LOGGER.info("Plotting Cross Validation...")
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    clf_cv = RandomForestClassifier(random_state=RANDOM_STATE)
+    clf_cv = RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1)
     scores = cross_val_score(
         clf_cv, X[top_feats], y.values.ravel(), cv=skf, scoring="accuracy"
     )
+
     plt.figure(figsize=(6, 6))
     sns.boxplot(y=scores, color="lightgreen")
     plt.title("5-fold Cross-validation Accuracy")
@@ -537,8 +555,9 @@ def random_forest_processing(args):
     plt.savefig("plots/cv_accuracy_boxplot.png")
     plt.show()
 
+    LOGGER.info("Plotting Features...")
     plot_feature_importance(
-        importances, feature_names, "plots/feature_importance.png", target
+        importances, feature_names, "plots/feature_importance.png", target_column_name
     )
     LOGGER.info("Feature importance plot saved as 'plots/feature_importance.png'.")
 
@@ -650,16 +669,6 @@ def random_forest_processing(args):
             final_pred = reg_pred
             clf_pred = [None] * len(reg_pred)
 
-    """
-    save_predictions_csv(
-        "model_predictions.csv",
-        X_test_sel,
-        y_test,
-        clf_pred,  
-        reg_pred,
-        ensemble_pred if ensemble_pred is not None else final_pred  # Use ensemble if available
-    )
-    """
     save_predictions_csv(
         "model_predictions.csv",
         wb_test,  # <- stable join key
@@ -670,16 +679,16 @@ def random_forest_processing(args):
     )
 
     df_plot = X[top_feats].copy()
-    df_plot[target] = y.values
+    df_plot[target_column_name] = y.values
     df_plot = df_plot.dropna()
     if target_type == "categorical":
-        df_plot[target] = df_plot[target].astype(str)
+        df_plot[target_column_name] = df_plot[target_column_name].astype(str)
 
         for feat in top_feats:
-            if feat not in df_model.columns:
+            if feat not in model_columns:
                 df_plot[feat] = df_plot[feat].astype("category")
     plot_feature_distributions(
-        df_plot, top_feats, target, target_type, output_dir="feature_plots"
+        df_plot, top_feats, target_column_name, target_type, output_dir="feature_plots"
     )
     LOGGER.info("Feature distribution plots saved to 'feature_plots/' directory.")
 
@@ -688,7 +697,7 @@ def random_forest_processing(args):
     return final_pred, model_used, X_train_sel, top_feats
 
 
-def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
+def explain_model(model, X, feature_names, target_name):
     # --- make X a DataFrame so .sample works and names align ---
     if isinstance(X, np.ndarray):
         if feature_names is None or len(feature_names) != X.shape[1]:
@@ -699,65 +708,58 @@ def explain_model(model, X, feature_names=None, target_name="target", top_n=15):
         if feature_names is None:
             feature_names = list(X_df.columns)
 
-    if PDP_2D_PAIRS:
-        for f1, f2 in PDP_2D_PAIRS:
-            if f1 in feature_names and f2 in feature_names:
-                idx1, idx2 = feature_names.index(f1), feature_names.index(f2)
-                LOGGER.info(f"\nGenerating 2D PDP for features: {f1} and {f2}")
+    partial_dep_args = []
+    for f1, f2 in PDP_2D_PAIRS:
+        if f1 in feature_names and f2 in feature_names:
+            args = [model, feature_names, X_df, f1, f2]
+            partial_dep_args.append(args)
 
-                X_pdp = X_df
-                if len(X_pdp) > 2000:
-                    X_pdp = X_pdp.sample(n=2000, random_state=RANDOM_STATE)
+    nprocs = min(len(partial_dep_args), os.cpu_count() or 1)
 
-                try:
-                    TARGET_CLASS_NAME = "Moderate"
-                    class_index = (
-                        list(model.classes_).index(TARGET_CLASS_NAME)
-                        if hasattr(model, "classes_")
-                        and TARGET_CLASS_NAME in model.classes_
-                        else None
-                    )
+    LOGGER.info(f"Calculating 2D PDPs using {nprocs} parallel processes...")
+    with PoolExecutor(max_workers=nprocs) as pool:
+        partial_dependencies = pool.map(calc_partial_dependence, partial_dep_args)
+    LOGGER.info("Calculation of 2D PDPs complete.")
 
-                    _ = PartialDependenceDisplay.from_estimator(
-                        model,
-                        X_pdp.values,
-                        [(idx1, idx2)],
-                        feature_names=feature_names,
-                        grid_resolution=25,
-                        **({"target": class_index} if class_index is not None else {}),
-                    )
-                    plt.tight_layout()
-                    out_file = f"plots/pdp_2d_{f1}_{f2}.png"
-                    plt.savefig(out_file, bbox_inches="tight")
-                    plt.close()
-                    LOGGER.info(f"2D PDP saved as {out_file}")
+    for args, pdp_res_2d in zip(partial_dep_args, partial_dependencies):
+        feat_name_1, feat_name_2 = args[-2], args[-1]
+        generate_pdp_2d_plot(
+            pdp_res_2d,
+            feat_name_1,
+            feat_name_2,
+        )
 
-                except Exception as e:
-                    LOGGER.info(f" Skipped 2D PDP for {f1} & {f2}: {e}")
-                    try:
-                        pdp_res_2d = partial_dependence(
-                            model,
-                            X_pdp.values,
-                            [(idx1, idx2)],
-                            feature_names=feature_names,
-                            grid_resolution=25,
-                        )
-                        grid1 = pdp_res_2d["grid_values"][0]
-                        grid2 = pdp_res_2d["grid_values"][1]
-                        avg_preds_2d = pdp_res_2d["average"][0]
-                        Xx, Yy = np.meshgrid(grid2, grid1)
-                        plt.figure(figsize=(6, 5))
-                        plt.contourf(Xx, Yy, avg_preds_2d, cmap="viridis")
-                        plt.colorbar(label="Predicted")
-                        plt.xlabel(f2)
-                        plt.ylabel(f1)
-                        plt.title(f"2D PDP of {f1} and {f2}")
-                        out_file = f"plots/pdp_2d_{f1}_{f2}_fallback.png"
-                        plt.savefig(out_file, bbox_inches="tight")
-                        plt.close()
-                        LOGGER.info(f"2D PDP saved (fallback) as {out_file}")
-                    except Exception as ee:
-                        LOGGER.info(f"Failed 2D PDP fallback for {f1} & {f2}: {ee}")
+
+def calc_partial_dependence(args):
+    model, feature_names, X_df, feat_name_1, feat_name_2 = args
+    idx1, idx2 = feature_names.index(feat_name_1), feature_names.index(feat_name_2)
+    X_pdp = X_df
+    if len(X_pdp) > 2000:
+        X_pdp = X_pdp.sample(n=2000, random_state=RANDOM_STATE)
+    return partial_dependence(
+        model,
+        X_pdp.values,
+        [(idx1, idx2)],
+        feature_names=feature_names,
+        grid_resolution=25,
+    )
+
+
+def generate_pdp_2d_plot(pdp_res_2d, feat_name_1, feat_name_2):
+    grid1 = pdp_res_2d["grid_values"][0]
+    grid2 = pdp_res_2d["grid_values"][1]
+    avg_preds_2d = pdp_res_2d["average"][0]
+    Xx, Yy = np.meshgrid(grid2, grid1)
+    plt.figure(figsize=(6, 5))
+    plt.contourf(Xx, Yy, avg_preds_2d, cmap="viridis")
+    plt.colorbar(label="Predicted")
+    plt.xlabel(feat_name_2)
+    plt.ylabel(feat_name_1)
+    plt.title(f"2D PDP of {feat_name_1} and {feat_name_2}")
+    out_file = f"plots/pdp_2d_{feat_name_1}_{feat_name_2}_fallback.png"
+    plt.savefig(out_file, bbox_inches="tight")
+    plt.close()
+    LOGGER.info(f"2D PDP saved as {out_file}")
 
 
 def save_1d_pdp_plots(
@@ -924,7 +926,7 @@ def save_1d_pdp_plots(
     return saved_files
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Data processing and modeling")
     parser.add_argument(
         "--excel_path",
@@ -934,7 +936,18 @@ if __name__ == "__main__":
     parser.add_argument("--parquet_path", type=str, default="wims_wfd_merged.parquet")
     parser.add_argument("--target", type=str, default="Ecological Class")
     args = parser.parse_args()
-    final_pred, model, X_train_used, feature_names_used = random_forest_processing(args)
+
+    if False:
+        df_classified_chem_data = process_and_aggregate(args)
+        df_classified_chem_data.to_parquet("process_input.parquet", index=False)
+    else:
+        df_classified_chem_data = pd.read_parquet("process_input.parquet")
+
+    target_column = args.target
+
+    final_pred, model, X_train_used, feature_names_used = random_forest_processing(
+        df_classified_chem_data, target_column
+    )
 
     os.makedirs("model_predictions", exist_ok=True)
     out_path = os.path.join("model_predictions", "final_predictions.csv")
@@ -944,7 +957,6 @@ if __name__ == "__main__":
         X_train_used,
         feature_names=feature_names_used,
         target_name=args.target,
-        top_n=15,
     )
 
     save_1d_pdp_plots(
@@ -955,6 +967,11 @@ if __name__ == "__main__":
         top_n=15,
         row_subsample=5000,
     )
+
+
+if __name__ == "__main__":
+    main()
+
 # accuracy and f1 for just predicting "moderate"
 # try quantiles
 # softwhere testing
