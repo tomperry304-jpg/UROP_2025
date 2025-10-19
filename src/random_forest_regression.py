@@ -11,6 +11,7 @@ import os
 import random
 import sys
 from concurrent.futures import ProcessPoolExecutor as PoolExecutor
+from pathlib import Path
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -63,6 +64,8 @@ PDP_2D_PAIRS = [
     ("Suspended Solids", "Orthophospht"),
     ("Conductivity", "Nitrate-N"),
 ]
+
+OUT_DIR = Path("plots")
 
 
 def determine_target_type(series, cat_threshold=15):
@@ -766,14 +769,13 @@ def save_1d_pdp_plots(
     model,
     X,
     feature_names=None,
-    out_dir="plots",
     top_n=15,
     grid_resolution=50,
     row_subsample=None,
     preferred_classes=(),
 ):
     """
-    Save 1D PDP images for the top_n features into `out_dir` as:
+    Save 1D PDP images for the top_n features as:
       - Regression:     pdp_1d_<feature>.png
       - Classification: pdp_1d_<feature>__class_<label>.png
 
@@ -785,8 +787,6 @@ def save_1d_pdp_plots(
         Data with the exact columns/order used to train `model`.
     feature_names : list[str] | None
         Column names. If None or length mismatch, falls back to generic names.
-    out_dir : str
-        Directory to write PNG files into.
     top_n : int
         Number of features to plot (by feature_importances_ if available).
     grid_resolution : int
@@ -825,13 +825,11 @@ def save_1d_pdp_plots(
     top_n = int(min(top_n, n_cols))
     feat_indices = order[:top_n].tolist()
 
-    os.makedirs(out_dir, exist_ok=True)
-
-    is_classifier = hasattr(model, "predict_proba") or hasattr(model, "classes_")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     class_targets = None
     class_labels = None
-    if is_classifier and hasattr(model, "classes_"):
+    if True:
         class_labels = list(model.classes_)
         if preferred_classes:
             mapped = []
@@ -847,83 +845,73 @@ def save_1d_pdp_plots(
         else:
             class_targets = list(range(len(class_labels)))
 
-    def _fresh_ax():
-        fig, ax = plt.subplots(figsize=(5, 4), constrained_layout=True)
-        return fig, ax
-
-    saved_files = []
+    args = []
     for idx in feat_indices:
-        fname = feature_names[idx]
+        for class_target in class_targets:
+            partial_dep_args = (
+                model,
+                feature_names,
+                idx,
+                grid_resolution,
+                X_df,
+                class_target,
+                class_labels,
+            )
+            args.append(partial_dep_args)
 
-        if is_classifier and class_targets is not None and len(class_targets) > 0:
-            for targ in class_targets:
-                fig, ax = _fresh_ax()
-                try:
-                    PartialDependenceDisplay.from_estimator(
-                        model,
-                        X_df,
-                        features=[idx],
-                        grid_resolution=grid_resolution,
-                        kind="average",
-                        target=targ,
-                        ax=ax,
-                    )
-                except TypeError:
-                    try:
-                        PartialDependenceDisplay.from_estimator(
-                            model,
-                            X_df,
-                            features=[idx],
-                            grid_resolution=grid_resolution,
-                            ax=ax,
-                        )
-                    except Exception:
-                        plt.close(fig)
-                        continue
-
-                ax.set_title(
-                    f"PDP: {fname} (class {class_labels[targ] if class_labels else targ})"
-                )
-                ax.set_xlabel(fname)
-                out_path = os.path.join(
-                    out_dir,
-                    f"pdp_1d_{fname}__class_{class_labels[targ] if class_labels else targ}.png",
-                )
-                fig.savefig(out_path, dpi=120)
-                plt.close(fig)
-                saved_files.append(out_path)
-        else:
-            fig, ax = _fresh_ax()
-            try:
-                PartialDependenceDisplay.from_estimator(
-                    model,
-                    X_df,
-                    features=[idx],
-                    grid_resolution=grid_resolution,
-                    kind="average",
-                    ax=ax,
-                )
-            except TypeError:
-                try:
-                    PartialDependenceDisplay.from_estimator(
-                        model,
-                        X_df,
-                        features=[idx],
-                        grid_resolution=grid_resolution,
-                        ax=ax,
-                    )
-                except Exception:
-                    plt.close(fig)
-                    continue
-
-            ax.set_title(f"PDP: {fname}")
-            ax.set_xlabel(fname)
-            out_path = os.path.join(out_dir, f"pdp_1d_{fname}.png")
-            fig.savefig(out_path, dpi=120)
-            plt.close(fig)
-            saved_files.append(out_path)
+    nprocs = min(len(args), os.cpu_count() or 1)
+    LOGGER.info(f"Calculating 1D PDPs using {nprocs} parallel processes...")
+    with PoolExecutor(max_workers=nprocs) as pool:
+        saved_files = pool.map(partial_dep_display, args)
 
     return saved_files
+
+
+def make_new_figure_axes():
+    fig, ax = plt.subplots(figsize=(5, 4), constrained_layout=True)
+    return fig, ax
+
+
+def partial_dep_display(args):
+    model, feature_names, idx, grid_resolution, X_df, class_target, class_labels = args
+    fname = feature_names[idx]
+
+    fig, ax = make_new_figure_axes()
+    try:
+        PartialDependenceDisplay.from_estimator(
+            model,
+            X_df,
+            features=[idx],
+            grid_resolution=grid_resolution,
+            kind="average",
+            target=class_target,
+            ax=ax,
+        )
+    except TypeError:
+        try:
+            PartialDependenceDisplay.from_estimator(
+                model,
+                X_df,
+                features=[idx],
+                grid_resolution=grid_resolution,
+                ax=ax,
+            )
+        except Exception:
+            plt.close(fig)
+            raise
+
+    ax.set_title(
+        f"PDP: {fname} (class {class_labels[class_target] if class_labels else class_target})"
+    )
+    ax.set_xlabel(fname)
+    out_path = (
+        OUT_DIR
+        / f"pdp_1d_{fname}__class_{class_labels[class_target] if class_labels else class_target}.png"
+    )
+
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
 
 
 def main():
@@ -963,7 +951,6 @@ def main():
         model,
         X_train_used,
         feature_names_used,
-        out_dir="plots",
         top_n=15,
         row_subsample=5000,
     )
