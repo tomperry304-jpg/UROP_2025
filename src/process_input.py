@@ -33,7 +33,7 @@ def _load_classification_data(excel_path):
     return df_excel
 
 
-def aggregate_parquet(df_parquet):
+def _aggregate_parquet(df_parquet):
     """
     Aggregate WIMS data by wb_id with richer features for better predictive power.
     """
@@ -133,6 +133,8 @@ def _load_chemical_data(parquet_path):
 
 
 def process_and_aggregate(args):
+    """Load and process input data from classification (Excel) and chemical (Parquet) files,
+    then merge them."""
     df_excel = _load_classification_data(args.excel_path)
 
     df_excel = df_excel.drop(columns=["Overall Water Body Class"], errors="ignore")
