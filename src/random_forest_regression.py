@@ -1,5 +1,5 @@
-# -*- coding: utf-8 -*-
-"""
+"""Random forest regression and classification models.
+
 Created on Sat Jul 26 18:28:04 2025
 
 @author: tompe
@@ -30,7 +30,7 @@ from sklearn.model_selection import (
 )
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder, OrdinalEncoder
 
-from process_input import process_and_aggregate
+from src.process_input import process_and_aggregate
 
 if sys.platform == "linux":
     matplotlib.use("Agg")  # Use non-GUI backend on Linux servers
@@ -68,20 +68,24 @@ PDP_2D_PAIRS = [
 OUT_DIR = Path("plots")
 
 
-def determine_target_type(series, cat_threshold=15):
-    """
-    Determine if the target series is categorical or continuous.
-    """
+def determine_target_type(series: pd.Series, cat_threshold: int = 15) -> str:
+    """Determine if the target series is categorical or continuous."""
     if pd.api.types.is_numeric_dtype(series):
         return "categorical" if series.nunique() <= cat_threshold else "continuous"
     else:
         return "categorical"
 
 
-def train_models(X_train, y_train, target_type):
-    """
-    Train RandomForest with hyperparameter tuning for better performance.
-    """
+def train_models(
+    X_train: pd.DataFrame | np.ndarray,
+    y_train: pd.Series | pd.DataFrame,
+    target_type: str,
+) -> tuple[
+    RandomForestClassifier | None,
+    RandomForestRegressor | None,
+    LabelEncoder | OneHotEncoder | OrdinalEncoder | np.ndarray | None,
+]:
+    """Train RandomForest with hyperparameter tuning for better performance."""
     clf = None
     reg = None
     encoder_or_bins = None
@@ -136,20 +140,24 @@ def train_models(X_train, y_train, target_type):
     return clf, reg, encoder_or_bins
 
 
-def get_top_features(importances, feature_names, top_n=15):
-    """
-    Return the top_n feature names based on importance scores.
-    """
+def get_top_features(
+    importances: np.ndarray,
+    feature_names: list[str],
+    top_n: int = 15,
+) -> tuple[list[str], list[tuple[str, float]]]:
+    """Return the top_n feature names based on importance scores."""
     feat_imp = sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)
     top_features = [f for f, imp in feat_imp[:top_n]]
     return top_features, feat_imp[:top_n]
 
 
-def plot_feature_importance(importances, feature_names, output_path, target_name=None):
-    """
-    Plot and save a bar chart of feature importances (top 15).
-    """
-
+def plot_feature_importance(
+    importances: np.ndarray,
+    feature_names: list[str],
+    output_path: str,
+    target_name: str | None = None,
+) -> None:
+    """Plot and save a bar chart of feature importances (top 15)."""
     feats, imps = zip(
         *sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)
     )
@@ -175,9 +183,15 @@ def plot_feature_importance(importances, feature_names, output_path, target_name
     plt.close()
 
 
-def plot_feature_distributions(df, features, target_name, target_type, output_dir):
-    """
-    Plot and save distribution plots for features.
+def plot_feature_distributions(
+    df: pd.DataFrame,
+    features: list[str],
+    target_name: str,
+    target_type: str,
+    output_dir: str,
+) -> None:
+    """Plot and save distribution plots for features.
+
     Categorical features: countplot; Continuous features: boxplot.
     Grouped by target variable (or its binned version if continuous).
     """
@@ -203,13 +217,19 @@ def plot_feature_distributions(df, features, target_name, target_type, output_di
         plt.figure(figsize=(8, 6))
         if pd.api.types.is_numeric_dtype(df_plot[feat]):
             sns.boxplot(x=hue_col, y=feat, data=df_plot)
-            title = f"Boxplot of {feat} by {'Target' if target_type == 'continuous' else target_name}"
+            title = (
+                f"Boxplot of {feat} by "
+                f"{'Target' if target_type == 'continuous' else target_name}"
+            )
             plt.title(title)
             plt.xlabel("Target Bin" if target_type == "continuous" else target_name)
             plt.ylabel(feat)
         else:
             sns.countplot(x=feat, hue=hue_col, data=df_plot)
-            title = f"Countplot of {feat} by {'Target' if target_type == 'continuous' else target_name}"
+            title = (
+                f"Countplot of {feat} by "
+                f"{'Target' if target_type == 'continuous' else target_name}"
+            )
             plt.title(title)
             plt.xlabel(feat)
             plt.ylabel("Count")
@@ -223,9 +243,18 @@ def plot_feature_distributions(df, features, target_name, target_type, output_di
         plt.savefig(out_file)
 
 
-def save_predictions_csv(filename, wb_ids, y_true, clf_pred, reg_pred, combined_pred):
-    """Write predictions with a stable join key for the map."""
+def save_predictions_csv(
+    filename: str,
+    wb_ids: list[str] | pd.Series,
+    y_true: pd.Series | np.ndarray,
+    clf_pred: pd.Series | np.ndarray | list[str | None],
+    reg_pred: pd.Series | np.ndarray,
+    combined_pred: pd.Series | np.ndarray,
+) -> None:
+    """Save predictions to CSV file.
 
+    Write predictions with a stable join key for the map.
+    """
     # Coerce to 1-D arrays and drop any pre-existing indices
     wb_ids_arr = (
         pd.Series(wb_ids, dtype="string")
@@ -263,8 +292,12 @@ def save_predictions_csv(filename, wb_ids, y_true, clf_pred, reg_pred, combined_
 
 
 def evaluate_and_plot_feature_performance(
-    X, y, feature_names, output_path="plots/feature_score_scatter.png"
-):
+    X: pd.DataFrame | np.ndarray,
+    y: pd.Series | np.ndarray,
+    feature_names: list[str] | None,
+    output_path: str = "plots/feature_score_scatter.png",
+) -> None:
+    """Evaluate and plot feature performance."""
     os.makedirs("plots", exist_ok=True)
 
     if isinstance(X, np.ndarray):
@@ -278,11 +311,13 @@ def evaluate_and_plot_feature_performance(
     results = []
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-    def normalize_labels(series):
-        return series.astype(str).str.strip().str.lower()
+    def normalize_labels(series: pd.Series | np.ndarray) -> pd.Series:
+        return pd.Series(series).astype(str).str.strip().str.lower()
 
     y_norm = normalize_labels(y)
 
+    if feature_names is None:
+        feature_names = []
     for feat in feature_names:
         LOGGER.info("Evaluating feature: %s", feat)
         acc_scores, f1_scores = [], []
@@ -385,9 +420,15 @@ def evaluate_and_plot_feature_performance(
     LOGGER.info(f"Scatter plot saved as '{output_path}'")
 
 
-def random_forest_processing(df_classified_chem_data, target_column_name):
-    if isinstance(target_column_name, list):
-        target_column_name = target_column_name[0]
+def random_forest_processing(
+    df_classified_chem_data: pd.DataFrame, target_column_name: str
+) -> tuple[
+    pd.Series,
+    RandomForestClassifier | RandomForestRegressor,
+    pd.DataFrame | np.ndarray,
+    list[str],
+]:
+    """Process data using random forest models."""
     if target_column_name not in df_classified_chem_data.columns:
         raise ValueError(f"Target '{target_column_name}' not in merged data.")
 
@@ -406,7 +447,7 @@ def random_forest_processing(df_classified_chem_data, target_column_name):
     model_columns = set(df_model.columns.tolist())
     df_model = None
 
-    # Fitler out 'Not Assessed' entries;
+    # Filter out 'Not Assessed' entries;
     mask = y.astype(str).str.lower().str.strip() != "not assessed"
     X = X[mask].reset_index(drop=True)
     y = y[mask].reset_index(drop=True)
@@ -624,6 +665,10 @@ def random_forest_processing(df_classified_chem_data, target_column_name):
         LOGGER.info(f"LightGBM Macro F1: {f1:.4f}")
 
     if target_type == "categorical":
+        if clf2 is None:
+            raise ValueError("Classifier is None for categorical target")
+        if reg2 is None:
+            raise ValueError("Regressor is None for categorical target")
         clf_pred_enc = clf2.predict(X_test_sel)
         reg_pred = reg2.predict(X_test_sel)
 
@@ -642,11 +687,15 @@ def random_forest_processing(df_classified_chem_data, target_column_name):
         combined_num = np.rint(avg_pred).astype(int)
 
         le = encoder_or_bins
+        if le is None or not isinstance(le, LabelEncoder):
+            raise ValueError("LabelEncoder is None or invalid for categorical target")
         combined_num = np.clip(combined_num, 0, len(le.classes_) - 1)
         final_pred = le.inverse_transform(combined_num)
         clf_pred = le.inverse_transform(clf_pred_enc)
 
     else:
+        if reg2 is None:
+            raise ValueError("Regressor is None for continuous target")
         reg_pred = reg2.predict(X_test_sel)
         if clf2 is not None:
             clf_pred_bins = clf2.predict(X_test_sel)
@@ -665,9 +714,6 @@ def random_forest_processing(df_classified_chem_data, target_column_name):
             )
             final_pred = 0.5 * (class_pred_numeric + reg_pred)
             clf_pred = clf_pred_bins
-
-            global ECO_CLASS
-            ECO_CLASS = final_pred
         else:
             final_pred = reg_pred
             clf_pred = [None] * len(reg_pred)
@@ -700,7 +746,13 @@ def random_forest_processing(df_classified_chem_data, target_column_name):
     return final_pred, model_used, X_train_sel, top_feats
 
 
-def explain_model(model, X, feature_names, target_name):
+def explain_model(
+    model: RandomForestClassifier | RandomForestRegressor,
+    X: pd.DataFrame | np.ndarray,
+    feature_names: list[str] | None,
+    target_name: str,
+) -> None:
+    """Explain model using SHAP values."""
     # --- make X a DataFrame so .sample works and names align ---
     if isinstance(X, np.ndarray):
         if feature_names is None or len(feature_names) != X.shape[1]:
@@ -733,25 +785,43 @@ def explain_model(model, X, feature_names, target_name):
         )
 
 
-def calc_partial_dependence(args):
+def calc_partial_dependence(
+    args: tuple[
+        RandomForestClassifier | RandomForestRegressor,
+        list[str],
+        pd.DataFrame,
+        str,
+        str,
+    ],
+) -> dict[str, np.ndarray]:
+    """Calculate partial dependence plots."""
     model, feature_names, X_df, feat_name_1, feat_name_2 = args
     idx1, idx2 = feature_names.index(feat_name_1), feature_names.index(feat_name_2)
     X_pdp = X_df
     if len(X_pdp) > 2000:
         X_pdp = X_pdp.sample(n=2000, random_state=RANDOM_STATE)
-    return partial_dependence(
+    result = partial_dependence(
         model,
         X_pdp.values,
         [(idx1, idx2)],
         feature_names=feature_names,
         grid_resolution=25,
     )
+    return {
+        "grid_values": result["grid_values"],
+        "average": result["average"],
+    }
 
 
-def generate_pdp_2d_plot(pdp_res_2d, feat_name_1, feat_name_2):
-    grid1 = pdp_res_2d["grid_values"][0]
-    grid2 = pdp_res_2d["grid_values"][1]
-    avg_preds_2d = pdp_res_2d["average"][0]
+def generate_pdp_2d_plot(
+    pdp_res_2d: dict[str, np.ndarray], feat_name_1: str, feat_name_2: str
+) -> None:
+    """Generate 2D partial dependence plot."""
+    grid_values = pdp_res_2d["grid_values"]
+    average = pdp_res_2d["average"]
+    grid1 = grid_values[0]
+    grid2 = grid_values[1]
+    avg_preds_2d = average[0]
     Xx, Yy = np.meshgrid(grid2, grid1)
     plt.figure(figsize=(6, 5))
     plt.contourf(Xx, Yy, avg_preds_2d, cmap="viridis")
@@ -766,16 +836,17 @@ def generate_pdp_2d_plot(pdp_res_2d, feat_name_1, feat_name_2):
 
 
 def save_1d_pdp_plots(
-    model,
-    X,
-    feature_names=None,
-    top_n=15,
-    grid_resolution=50,
-    row_subsample=None,
-    preferred_classes=(),
-):
-    """
-    Save 1D PDP images for the top_n features as:
+    model: RandomForestClassifier | RandomForestRegressor,
+    X: pd.DataFrame | np.ndarray,
+    feature_names: list[str] | None = None,
+    top_n: int = 15,
+    grid_resolution: int = 50,
+    row_subsample: int | None = None,
+    preferred_classes: tuple[int | str, ...] = (),
+) -> list[Path]:
+    """Save 1D PDP images for the top_n features.
+
+    Files saved as:
       - Regression:     pdp_1d_<feature>.png
       - Classification: pdp_1d_<feature>__class_<label>.png
 
@@ -797,7 +868,6 @@ def save_1d_pdp_plots(
         For classifiers, if non-empty, only these class labels (names or indices)
         are plotted; otherwise all classes are plotted.
     """
-
     X = np.asarray(X)
     n_rows, n_cols = X.shape
 
@@ -834,7 +904,7 @@ def save_1d_pdp_plots(
         if preferred_classes:
             mapped = []
             for c in preferred_classes:
-                if isinstance(c, (int, np.integer)) and 0 <= c < len(class_labels):
+                if isinstance(c, int | np.integer) and 0 <= c < len(class_labels):
                     mapped.append(c)
                 else:
                     try:
@@ -862,17 +932,29 @@ def save_1d_pdp_plots(
     nprocs = min(len(args), os.cpu_count() or 1)
     LOGGER.info(f"Calculating 1D PDPs using {nprocs} parallel processes...")
     with PoolExecutor(max_workers=nprocs) as pool:
-        saved_files = pool.map(partial_dep_display, args)
+        saved_files = list(pool.map(partial_dep_display, args))
 
     return saved_files
 
 
-def make_new_figure_axes():
+def make_new_figure_axes() -> tuple[plt.Figure, plt.Axes]:
+    """Create a new figure and axes for plotting."""
     fig, ax = plt.subplots(figsize=(5, 4), constrained_layout=True)
     return fig, ax
 
 
-def partial_dep_display(args):
+def partial_dep_display(
+    args: tuple[
+        RandomForestClassifier | RandomForestRegressor,
+        list[str],
+        int,
+        int,
+        pd.DataFrame,
+        int,
+        list[str] | None,
+    ],
+) -> Path:
+    """Display partial dependence plot for a single feature."""
     model, feature_names, idx, grid_resolution, X_df, class_target, class_labels = args
     fname = feature_names[idx]
 
@@ -900,21 +982,18 @@ def partial_dep_display(args):
             plt.close(fig)
             raise
 
-    ax.set_title(
-        f"PDP: {fname} (class {class_labels[class_target] if class_labels else class_target})"
-    )
+    class_label = class_labels[class_target] if class_labels else class_target
+    ax.set_title(f"PDP: {fname} (class {class_label})")
     ax.set_xlabel(fname)
-    out_path = (
-        OUT_DIR
-        / f"pdp_1d_{fname}__class_{class_labels[class_target] if class_labels else class_target}.png"
-    )
+    out_path = OUT_DIR / f"pdp_1d_{fname}__class_{class_label}.png"
 
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
     return out_path
 
 
-def main():
+def main() -> None:
+    """Main entry point for data processing and modeling."""
     parser = argparse.ArgumentParser(description="Data processing and modeling")
     parser.add_argument(
         "--excel_path",
@@ -925,11 +1004,8 @@ def main():
     parser.add_argument("--target", type=str, default="Ecological Class")
     args = parser.parse_args()
 
-    if True:
-        df_classified_chem_data = process_and_aggregate(args)
-        df_classified_chem_data.to_parquet("process_input.parquet", index=False)
-    else:
-        df_classified_chem_data = pd.read_parquet("process_input.parquet")
+    df_classified_chem_data = process_and_aggregate(args)
+    df_classified_chem_data.to_parquet("process_input.parquet", index=False)
 
     target_column = args.target
 
@@ -938,7 +1014,6 @@ def main():
     )
 
     os.makedirs("model_predictions", exist_ok=True)
-    out_path = os.path.join("model_predictions", "final_predictions.csv")
 
     explain_model(
         model,
@@ -962,9 +1037,9 @@ if __name__ == "__main__":
 # accuracy and f1 for just predicting "moderate"
 # try quantiles
 # softwhere testing
-# alterative AI prosseing
-# more interactive data visulisation "streamlit"
+# alternative AI processing
+# more interactive data visualisation "streamlit"
 # orange "load in data and describe it"
-# data visuliation, robustness, more usfull
-# interal anual varaiblity
-# intigrate it into an "app" - streamlit
+# data visualisation, robustness, more useful
+# internal annual variability
+# integrate it into an "app" - streamlit
