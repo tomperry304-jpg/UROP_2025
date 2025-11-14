@@ -66,4 +66,4 @@ Python 3.11+. See `pyproject.toml` for dependencies.
 
 ## Contact
 
-Barnaby Dobson - <b.dobson@imperial.ac.uk>
+Tom Perry - <tom.perry23@imperial.ac.uk>
