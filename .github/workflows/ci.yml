@@ -1,0 +1,34 @@
+name: Test and build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ${{matrix.os}}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version: ['3.12']
+
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install poetry
+        run: pipx install poetry
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{matrix.python-version}}
+          cache: poetry
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Run tests
+        run: poetry run pytest

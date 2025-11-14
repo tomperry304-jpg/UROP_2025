@@ -1,6 +1,6 @@
 # UROP 2025 - Environment Machine Learning Project
 
-Environment machine learning project for UROP (Undergraduate Research Opportunities Programme).
+Environment machine learning project for UROP.
 
 ## Installation
 
