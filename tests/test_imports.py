@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 
 def test_import_process_input() -> None:
     """Test that process_input module can be imported."""
@@ -22,7 +20,8 @@ def test_import_streamlit_app() -> None:
 
 def test_import_src_package() -> None:
     """Test that src package can be imported."""
-    import src  # noqa: F401
+    import src
+
     assert src.__version__ == "0.1.0"
 
 
@@ -35,7 +34,6 @@ def test_import_functions_from_random_forest() -> None:
     """Test that functions can be imported from random_forest_regression."""
     from src.random_forest_regression import (  # noqa: F401
         determine_target_type,
-        train_models,
         random_forest_processing,
+        train_models,
     )
-

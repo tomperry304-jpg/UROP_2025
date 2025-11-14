@@ -37,4 +37,3 @@ repos:
     hooks:
       - id: codespell
         args: [-I, .codespell_ignore.txt]
-
