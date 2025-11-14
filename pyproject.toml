@@ -1,20 +1,77 @@
-[project]
+[tool.poetry]
 name = "UROP_tom_perry"
 version = "0.1.0"
 description = "Environment machine learning for UROP project"
-readme = "README.md"
-requires-python = ">=3.11"
-dependencies = [
-    "numpy",
-    "pandas",
-    "geopandas",
-    "folium",
-    "scipy",
-    "scikit-learn",
-    "matplotlib",
-    "seaborn",
-    "lightgbm",
-    "openpyxl>=3.1.5",
-    "pyarrow>=21.0.0",
-    "streamlit>=1.50.0",
+authors = [
+    "Barnaby Dobson <b.dobson@imperial.ac.uk>"
 ]
+readme = "README.md"
+packages = [{include = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+numpy = "*"
+pandas = "*"
+geopandas = "*"
+folium = "*"
+scipy = "*"
+scikit-learn = "*"
+matplotlib = "*"
+seaborn = "*"
+lightgbm = "*"
+openpyxl = ">=3.1.5"
+pyarrow = ">=21.0.0"
+streamlit = ">=1.50.0"
+
+[tool.poetry.group.dev.dependencies]
+mypy = "^1.17.1"
+pytest = "^8.4.2"
+pytest-cov = "^7.0.0"
+pytest-mock = "^3.14.1"
+pre-commit = "^4.3.0"
+ruff = "^0.14.3"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.mypy]
+disallow_any_explicit = true
+disallow_any_generics = true
+warn_unreachable = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+exclude = [".venv/", "docs/"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["requests.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "-v -p no:warnings --cov=src --cov-report=html --doctest-modules"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+exclude = [".venv", ".git", "__pycache__", "htmlcov"]
+
+[tool.ruff.lint]
+select = [
+    "D",   # pydocstyle
+    "E",   # pycodestyle
+    "F",   # Pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "RUF"  # ruff
+]
+pydocstyle.convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D100", "D104"] # Missing docstring in public module, Missing docstring in public package
+"src/*" = ["D100"] # Missing docstring in public module (scripts may not need docstrings)
+
+[tool.codespell]
+skip="*.geojson"
