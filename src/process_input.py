@@ -1,4 +1,5 @@
 import logging
+from argparse import Namespace
 
 import numpy as np
 import pandas as pd
@@ -6,10 +7,11 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 
 
-def _load_classification_data(excel_path):
-    """
-    Load all sheets from the Excel file, concatenate them, and drop columns with >=50% missing values.
-    Skips the second header row which repeats labels.
+def _load_classification_data(excel_path: str) -> pd.DataFrame:
+    """Load all sheets from the Excel file, concatenate them, and drop columns.
+
+    Drops columns with >=50% missing values. Skips the second header row
+    which repeats labels.
     """
     all_sheets = []
     try:
@@ -33,10 +35,8 @@ def _load_classification_data(excel_path):
     return df_excel
 
 
-def _aggregate_parquet(df_parquet):
-    """
-    Aggregate WIMS data by wb_id with richer features for better predictive power.
-    """
+def _aggregate_parquet(df_parquet: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate WIMS data by wb_id with richer features for better predictive power."""
     numeric_cols = df_parquet.select_dtypes(include=np.number).columns.tolist()
 
     agg_df = df_parquet.groupby("wb_id")[numeric_cols].agg(
@@ -112,15 +112,17 @@ def _aggregate_parquet(df_parquet):
     return agg_df
 
 
-def _load_chemical_data(parquet_path):
-    """
-    Load Parquet file and drop columns with <1,000,000 non-null values.
+def _load_chemical_data(parquet_path: str) -> pd.DataFrame:
+    """Load Parquet file and drop columns.
+
+    Drops columns with <1,000,000 non-null values.
     """
     try:
         df_parquet = pd.read_parquet(parquet_path)
     except ImportError:
         raise ImportError(
-            "PyArrow or fastparquet is required to read Parquet files. Install one to proceed."
+            "PyArrow or fastparquet is required to read Parquet files. "
+            "Install one to proceed."
         )
     except Exception as e:
         raise Exception(f"Error reading Parquet file: {e}")
@@ -132,9 +134,11 @@ def _load_chemical_data(parquet_path):
     return df_parquet
 
 
-def process_and_aggregate(args):
-    """Load and process input data from classification (Excel) and chemical (Parquet) files,
-    then merge them."""
+def process_and_aggregate(args: Namespace) -> pd.DataFrame:
+    """Load and process input data from classification and chemical files.
+
+    Processes Excel and Parquet files, then merges them.
+    """
     df_excel = _load_classification_data(args.excel_path)
 
     df_excel = df_excel.drop(columns=["Overall Water Body Class"], errors="ignore")

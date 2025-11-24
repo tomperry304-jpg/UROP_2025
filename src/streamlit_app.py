@@ -1,6 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-Model plots dashboard + UK catchment predictions map (single file).
+"""Model plots dashboard + UK catchment predictions map (single file).
 
 - When run normally (Spyder / python), it launches Streamlit and shows:
   • Feature plots from ./feature_plots and ./plots
@@ -24,8 +22,8 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional, Tuple
 
 import folium
 import geopandas as gpd
@@ -37,21 +35,21 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # -------------------------- DEFAULT PATHS & SETTINGS --------------------------
-# Define default input file paths, output file paths, prediction column, and other constants
+# Define default input file paths, output file paths, prediction column,
+# and other constants
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Default geometry and CSV file paths (adjust if needed)
-DEFAULT_GEO_PATH = Path(
-    r"C:\UROP\WFD_River_Water_Body_Catchments_Cycle_2.zip"
-)
+DEFAULT_GEO_PATH = Path(r"C:\UROP\WFD_River_Water_Body_Catchments_Cycle_2.zip")
 
 DEFAULT_CSV_PATH = Path(
     r"C:\Users\tompe\Documents\UROP_local\src\model_predictions.csv"
 )
 
-#DEFAULT_CSV_PATH = Path(
-#    r"C:\Users\tompe\OneDrive - Imperial College London\Year 2\UROP\Project\model_predictions\final_predictions.csv"
-#)
+# DEFAULT_CSV_PATH = Path(
+#    r"C:\Users\tompe\OneDrive - Imperial College London\Year 2\UROP\"
+#    r"Project\model_predictions\final_predictions.csv"
+# )
 
 # Default prediction column name for map colouring
 DEFAULT_PRED_COL = "Pred_Combined"
@@ -71,21 +69,33 @@ PLOTS_DIR = SCRIPT_DIR / "plots"
 # Filename patterns to categorize plots
 PATTERNS = {
     "summary": ["correlation", "feature_importance", "feature_score", "scatter"],
-    "pdp_1d":  ["pdp_1d_"],
-    "pdp_2d":  ["pdp_2d_"],
+    "pdp_1d": ["pdp_1d_"],
+    "pdp_2d": ["pdp_2d_"],
 }
 
 # Colour palette for map (categorical or quantile bins)
 PALETTE = [
-    "#3182bd", "#41ab5d", "#de2d26", "#756bb1", "#8c510a",
-    "#fc8d62", "#66c2a5", "#a6d854", "#e78ac3", "#bdbdbd"
+    "#3182bd",
+    "#41ab5d",
+    "#de2d26",
+    "#756bb1",
+    "#8c510a",
+    "#fc8d62",
+    "#66c2a5",
+    "#a6d854",
+    "#e78ac3",
+    "#bdbdbd",
 ]
+
 
 # -------------------------- UTILITY FUNCTIONS --------------------------
 # Utility functions for geometry data loading and processing
 # (file path resolution, geometry reading, CRS normalization, simplification)
 def resolve_geo_path(raw: str | Path, search_dir: Path) -> Path:
-    """Resolve a given path (possibly relative or missing extension) to an existing geometry file."""
+    """Resolve a path to an existing geometry file.
+
+    Handles relative paths and missing extensions.
+    """
     cand = Path(raw)
     if not cand.is_absolute():
         cand = (search_dir / cand).resolve()
@@ -93,8 +103,13 @@ def resolve_geo_path(raw: str | Path, search_dir: Path) -> Path:
         return cand
 
     stem = cand.with_suffix("")
-    for p in [stem.with_suffix(".zip"), stem.with_suffix(".shp"),
-              stem, stem.with_suffix(".geojson"), stem.with_suffix(".json")]:
+    for p in [
+        stem.with_suffix(".zip"),
+        stem.with_suffix(".shp"),
+        stem,
+        stem.with_suffix(".geojson"),
+        stem.with_suffix(".json"),
+    ]:
         if p.exists():
             return p
 
@@ -102,11 +117,16 @@ def resolve_geo_path(raw: str | Path, search_dir: Path) -> Path:
         if p.exists():
             return p
 
-    raise FileNotFoundError(f"Could not find geometry at '{raw}' (searched around {search_dir}).")
+    raise FileNotFoundError(
+        f"Could not find geometry at '{raw}' (searched around {search_dir})."
+    )
 
 
 def read_geometry_any(path_like: str | Path, script_dir: Path) -> gpd.GeoDataFrame:
-    """Read geometry data from various formats (zip, shapefile, GeoJSON) into a GeoDataFrame (WGS84)."""
+    """Read geometry data from various formats into a GeoDataFrame.
+
+    Supports zip, shapefile, GeoJSON formats. Returns WGS84 CRS.
+    """
     p = resolve_geo_path(path_like, script_dir)
 
     if p.suffix.lower() in (".geojson", ".json"):
@@ -151,10 +171,14 @@ def simplify_for_web(gdf: gpd.GeoDataFrame, tol_m: float) -> gpd.GeoDataFrame:
         return gdf
     return tmp
 
+
 # -------------------------- PREDICTION DATA JOINING --------------------------
 # Functions to normalize identifiers and join prediction CSV data to geometry
 def norm_series(s: pd.Series) -> pd.Series:
-    """Strip whitespace, lowercase, and remove non-alphanumeric characters from a Series."""
+    """Normalize a Series.
+
+    Strips whitespace, lowercases, and removes non-alphanumeric characters.
+    """
     return (
         pd.Series(s, dtype="string")
         .str.strip()
@@ -163,8 +187,13 @@ def norm_series(s: pd.Series) -> pd.Series:
     )
 
 
-def find_best_join(gdf: gpd.GeoDataFrame, df: pd.DataFrame) -> Tuple[Optional[str], Optional[str], int]:
-    """Find the pair of fields (GeoDataFrame & DataFrame) with the greatest overlap of normalized values."""
+def find_best_join(
+    gdf: gpd.GeoDataFrame, df: pd.DataFrame
+) -> tuple[str | None, str | None, int]:
+    """Find fields with greatest overlap of normalized values.
+
+    Compares GeoDataFrame and DataFrame fields.
+    """
     geo_fields = [c for c in gdf.columns if c != gdf.geometry.name]
     csv_fields = df.columns.tolist()
     best = (None, None, -1)
@@ -190,12 +219,12 @@ def join_predictions(
     gdf: gpd.GeoDataFrame,
     df: pd.DataFrame,
     pred_col: str,
-    logger: Optional[Callable[[str], None]] =print,
+    logger: Callable[[str], None] | None = print,
 ) -> gpd.GeoDataFrame:
     """Join prediction data with geometry data.
 
-    Prefer exact join on "wb_id". If no match, use heuristic text matching on other fields,
-    and as a last resort, join by row order.
+    Prefer exact join on "wb_id". If no match, use heuristic text matching
+    on other fields, and as a last resort, join by row order.
     """
     log = logger or (lambda *_: None)
 
@@ -216,7 +245,10 @@ def join_predictions(
 
     # 2) Best heuristic join
     g_field, c_field, overlap = find_best_join(gdf, df)
-    log(f"Heuristic match → geometry: '{g_field}'  CSV: '{c_field}'  (overlap: {overlap})")
+    log(
+        f"Heuristic match → geometry: '{g_field}'  CSV: '{c_field}'  "
+        f"(overlap: {overlap})"
+    )
 
     if g_field and c_field and overlap > 0:
         left = gdf.copy()
@@ -226,7 +258,9 @@ def join_predictions(
         right = right[[c_field, pred_col]].dropna().copy()
         right.rename(columns={c_field: g_field}, inplace=True)
         merged = left.merge(right, on=g_field, how="left")
-        log(f"Strict overlap (non-null): {merged[pred_col].notna().sum()}/{len(merged)}")
+        log(
+            f"Strict overlap (non-null): {merged[pred_col].notna().sum()}/{len(merged)}"
+        )
         return merged
 
     # 3) Loose normalised join
@@ -253,12 +287,17 @@ def join_predictions(
     # 4) Final fallback: positional (warn)
     log("⚠️  No key overlap at all. Falling back to positional join (row order).")
     merged = gdf.copy()
-    merged[pred_col] = pd.Series(df[pred_col].values[:len(gdf)], index=merged.index)
+    merged[pred_col] = pd.Series(df[pred_col].values[: len(gdf)], index=merged.index)
     return merged
+
 
 # -------------------------- MAP BUILDING FUNCTIONS --------------------------
 # Functions to build the Folium map and orchestrate map generation
-def build_map(merged_gdf: gpd.GeoDataFrame, pred_col: str, name_cols=None) -> folium.Map:
+def build_map(
+    merged_gdf: gpd.GeoDataFrame,
+    pred_col: str,
+    name_cols: list[str] | None = None,
+) -> folium.Map:
     """Create a Folium map with features colored by the given prediction column."""
     if name_cols is None:
         name_cols = ["wb_name", "wb_id", "rbd_name", "rbd_id", "OC_NAME", "id"]
@@ -282,45 +321,81 @@ def build_map(merged_gdf: gpd.GeoDataFrame, pred_col: str, name_cols=None) -> fo
         finite = vals.replace([np.inf, -np.inf], np.nan).dropna()
         if finite.empty or float(finite.min()) == float(finite.max()):
             labels = ["No variation"]
-            def pick_color(_): return PALETTE[-1]
+
+            def pick_color(v: float | str | None) -> str:
+                return PALETTE[-1]
         else:
             q = np.unique(np.quantile(finite, np.linspace(0, 1, 6)))
             if len(q) < 6:
                 q = np.linspace(float(finite.min()), float(finite.max()), 6)
             labels = [f"[{q[i]:.3g}, {q[i+1]:.3g}]" for i in range(5)]
-            def pick_color(v):
-                if pd.isna(v): return PALETTE[-1]
+
+            def pick_color(v: float | str | None) -> str:
+                if pd.isna(v):
+                    return PALETTE[-1]
+                v_float = float(v) if isinstance(v, int | float) else 0.0
                 for i in range(5):
-                    if (v >= q[i]) and (v < q[i+1] or (i == 4 and v <= q[i+1])):
+                    if (v_float >= q[i]) and (
+                        v_float < q[i + 1] or (i == 4 and v_float <= q[i + 1])
+                    ):
                         return PALETTE[i]
                 return PALETTE[-1]
     else:
         cats = pd.Categorical(series.astype(str)).categories.tolist()
         labels = cats if cats else ["No data"]
         cmap = {c: PALETTE[i % len(PALETTE)] for i, c in enumerate(labels)}
-        def pick_color(v): return cmap.get(str(v), PALETTE[-1])
 
-    def best_name(props):
+        def pick_color(v: float | str | None) -> str:
+            if v is None:
+                return PALETTE[-1]
+            return cmap.get(str(v), PALETTE[-1])
+
+    def best_name(props: dict[str, object]) -> str:
         for k in name_cols:
             if k in props and props[k] not in (None, "", "nan"):
                 return str(props[k])
         return str(props.get("id", "Feature"))
 
+    def _get_property_value(feat: dict[str, object], key: str) -> str | None:
+        """Extract property value from feature dict."""
+        props = feat.get("properties")
+        if isinstance(props, dict):
+            return str(props.get(key))
+        return None
+
     gj = json.loads(merged_gdf.to_json())
     for f in gj["features"]:
         props = f.get("properties", {})
-        props["_tip"] = f"{best_name(props)} — {pred_col}: {props.get(pred_col, 'No data')}"
+        props["_tip"] = (
+            f"{best_name(props)} — {pred_col}: {props.get(pred_col, 'No data')}"
+        )
 
-    def style_polygon(feat):
-        v = feat["properties"].get(pred_col)
+    def style_polygon(feat: dict[str, object]) -> dict[str, str | float]:
+        props = feat.get("properties", {})
+        if not isinstance(props, dict):
+            props = {}
+        v = props.get(pred_col)
         c = pick_color(pd.to_numeric(v, errors="coerce") if is_numeric else v)
         return {"fillColor": c, "color": "#555", "weight": 1, "fillOpacity": 0.7}
 
     folium.GeoJson(
         gj,
-        style_function=style_polygon if is_polygonal else (lambda f: {"color": pick_color(f["properties"].get(pred_col)), "weight": 4}),
-        tooltip=folium.GeoJsonTooltip(fields=["_tip"], aliases=[""], labels=False, sticky=True),
-        highlight_function=(lambda _: {"weight": 3, "color": "#000"}) if is_polygonal else None,
+        style_function=style_polygon
+        if is_polygonal
+        else (
+            lambda f: {
+                "color": pick_color(
+                    _get_property_value(f, pred_col) if isinstance(f, dict) else None
+                ),
+                "weight": 4,
+            }
+        ),
+        tooltip=folium.GeoJsonTooltip(
+            fields=["_tip"], aliases=[""], labels=False, sticky=True
+        ),
+        highlight_function=(lambda _: {"weight": 3, "color": "#000"})
+        if is_polygonal
+        else None,
     ).add_to(m)
 
     # Legend
@@ -330,12 +405,15 @@ def build_map(merged_gdf: gpd.GeoDataFrame, pred_col: str, name_cols=None) -> fo
         "box-shadow: 0 1px 4px rgba(0,0,0,0.2); font-size: 12px;'>",
         f"<b>{pred_col}</b><br>",
     ]
-    labels_to_show = sorted({str(v) for v in series.dropna().unique()}) if not is_numeric else labels
+    labels_to_show = (
+        sorted({str(v) for v in series.dropna().unique()}) if not is_numeric else labels
+    )
     for i, lbl in enumerate(labels_to_show):
         color = PALETTE[i % len(PALETTE)]
         legend_html.append(
-            f"<div><span style='display:inline-block;width:12px;height:12px;background:{color};"
-            f"border:1px solid #555;margin-right:6px;'></span>{lbl}</div>"
+            f"<div><span style='display:inline-block;width:12px;height:12px;"
+            f"background:{color};border:1px solid #555;margin-right:6px;'></span>"
+            f"{lbl}</div>"
         )
     legend_html.append("</div>")
     m.get_root().html.add_child(folium.Element("".join(legend_html)))
@@ -348,8 +426,8 @@ def build_and_save_map(
     pred_col: str,
     out_geo: Path,
     out_html: Path,
-    logger: Optional[Callable[[str], None]] = print,
-) -> Tuple[gpd.GeoDataFrame, folium.Map]:
+    logger: Callable[[str], None] | None = print,
+) -> tuple[gpd.GeoDataFrame, folium.Map]:
     """Read input files, join predictions, build map, and save output files."""
     log = logger or (lambda *_: None)
     # Load input files and join prediction data
@@ -376,9 +454,10 @@ def build_and_save_map(
     log(f"Saved map → {out_html}")
     return merged, fmap
 
+
 # -------------------------- STREAMLIT APP --------------------------
 # Streamlit app components for interactive plots and map interface
-def imgs_in(folder: Path):
+def imgs_in(folder: Path) -> list[Path]:
     """Return a sorted list of PNG images in the given folder."""
     if not folder.exists():
         return []
@@ -392,7 +471,7 @@ def caption(p: Path) -> str:
     return p.stem.replace("_", " ").title()
 
 
-def filter_by_patterns(paths, patterns):
+def filter_by_patterns(paths: list[Path], patterns: list[str]) -> list[Path]:
     """Filter a list of files by a set of substrings (case-insensitive)."""
     if not patterns:
         return paths
@@ -405,13 +484,16 @@ def filter_by_patterns(paths, patterns):
     return out
 
 
-def render_app():
+def render_app() -> None:
     """Render the Streamlit dashboard UI for plots and map building."""
     # Set page config at the start to avoid Streamlit config errors
     st.set_page_config(page_title="Model Plots Dashboard", layout="centered")
 
     st.title("Model Analysis Plots Dashboard")
-    st.write("Feature plots plus curated images from `feature_plots/` and `plots/`, and a predictions map.")
+    st.write(
+        "Feature plots plus curated images from `feature_plots/` and `plots/`, "
+        "and a predictions map."
+    )
 
     # --- Feature plots
     feat_imgs = imgs_in(FEATURE_DIR)
@@ -424,7 +506,9 @@ def render_app():
         else:
             st.write("_No images found in `feature_plots`._")
 
-    with st.expander("Other Analysis Plots (Feature Importance & Correlation)", expanded=False):
+    with st.expander(
+        "Other Analysis Plots (Feature Importance & Correlation)", expanded=False
+    ):
         section_imgs = filter_by_patterns(all_plots, PATTERNS["summary"])
         if section_imgs:
             for p in section_imgs:
@@ -451,7 +535,9 @@ def render_app():
     st.markdown("---")
     st.header("Catchment Predictions Map")
 
-    geo_path = st.text_input("Geometry path (.zip/.shp/.geojson)", str(DEFAULT_GEO_PATH))
+    geo_path = st.text_input(
+        "Geometry path (.zip/.shp/.geojson)", str(DEFAULT_GEO_PATH)
+    )
     csv_path = st.text_input("Predictions CSV path", str(DEFAULT_CSV_PATH))
     pred_col = st.text_input("Prediction column", DEFAULT_PRED_COL)
 
@@ -460,7 +546,7 @@ def render_app():
         if st.button("Build / Refresh Map", type="primary"):
             log_lines = []
 
-            def slog(msg: str):
+            def slog(msg: str) -> None:
                 log_lines.append(str(msg))
 
             try:
@@ -472,13 +558,18 @@ def render_app():
                     OUT_MAP_HTML,
                     logger=slog,
                 )
-                st.success(f"Join success (non-null): {merged[pred_col].notna().sum()}/{len(merged)}")
+                st.success(
+                    f"Join success (non-null): "
+                    f"{merged[pred_col].notna().sum()}/{len(merged)}"
+                )
                 # embed map
                 components.html(fmap.get_root().render(), height=720, scrolling=False)
                 with st.expander("Build log"):
                     for ln in log_lines:
                         st.text(ln)
-                st.caption(f"Saved: {OUT_MERGED_GEO.name} and {OUT_MAP_HTML.name} in {OUT_DIR}")
+                st.caption(
+                    f"Saved: {OUT_MERGED_GEO.name} and {OUT_MAP_HTML.name} in {OUT_DIR}"
+                )
             except Exception as e:
                 st.error(f"Build failed: {e}")
 
@@ -487,21 +578,22 @@ def render_app():
         st.write("Merged GeoJSON:", str(OUT_MERGED_GEO))
         st.write("HTML Map:", str(OUT_MAP_HTML))
 
+
 # -------------------------- CLI MAIN --------------------------
 # Command-line interface: parse arguments and run map generation without UI
-def run_cli(argv=None):
+def run_cli(argv: list[str] | None = None) -> None:
     """Parse CLI arguments and run the map generation (no Streamlit UI)."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--geo",      default=str(DEFAULT_GEO_PATH))
-    parser.add_argument("--csv",      default=str(DEFAULT_CSV_PATH))
+    parser.add_argument("--geo", default=str(DEFAULT_GEO_PATH))
+    parser.add_argument("--csv", default=str(DEFAULT_CSV_PATH))
     parser.add_argument("--pred-col", dest="pred_col", default=DEFAULT_PRED_COL)
-    parser.add_argument("--out-geo",  dest="out_geo",  default=str(OUT_MERGED_GEO))
+    parser.add_argument("--out-geo", dest="out_geo", default=str(OUT_MERGED_GEO))
     parser.add_argument("--out-html", dest="out_html", default=str(OUT_MAP_HTML))
     args = parser.parse_args(argv)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)  # Ensure output directory exists
 
-    def plog(msg: str):
+    def plog(msg: str) -> None:
         print(msg)
 
     merged, _ = build_and_save_map(
@@ -512,8 +604,11 @@ def run_cli(argv=None):
         Path(args.out_html),
         logger=plog,
     )
-    print(f"Join success (non-null): {merged[args.pred_col].notna().sum()}/{len(merged)}")
-    return 0
+    print(
+        f"Join success (non-null): {merged[args.pred_col].notna().sum()}/{len(merged)}"
+    )
+    return None
+
 
 # -------------------------- ENTRY POINT --------------------------
 # Determine mode (CLI vs Streamlit) and execute accordingly
@@ -521,14 +616,19 @@ if __name__ == "__main__":
     # If "--cli" flag is present, run CLI mode and exit
     if "--cli" in sys.argv:
         sys.argv.remove("--cli")
-        raise SystemExit(run_cli(sys.argv[1:]))
+        run_cli(sys.argv[1:])
+        sys.exit(0)
 
     # Not launched from Streamlit: start a new Streamlit process
     if os.environ.get("STREAMLIT_LAUNCHED_FROM_SCRIPT") != "1":
         env = os.environ.copy()
         env["STREAMLIT_LAUNCHED_FROM_SCRIPT"] = "1"
         cmd = [
-            sys.executable, "-m", "streamlit", "run", __file__,
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            __file__,
             "--server.fileWatcherType=none",
             "--browser.gatherUsageStats=false",
         ]
